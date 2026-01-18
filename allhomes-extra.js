@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.6.5
+// @version      0.8.0
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        none
@@ -13,11 +13,47 @@
   if (location.pathname.startsWith("/sale/search")) return;
 
   const PANEL_ID = "ahx_panel_stable";
-
   const SEARCH_ENDPOINT = "https://www.allhomes.com.au/wsvc/search/sale-residential";
   const RANGE_LOW = 500000;
   const RANGE_HIGH = 1500000;
   const STEP = 10000;
+
+  // Pre-computed formatted strings
+  const RANGE_LOW_STR = RANGE_LOW.toLocaleString();
+  const RANGE_HIGH_STR = RANGE_HIGH.toLocaleString();
+
+  // State tracking
+  let lastUrl = location.href;
+  let lastListingId = null;
+  let currentRunId = 0;
+
+  // ---- Utilities ----
+
+  function escapeHtml(str) {
+    if (typeof str !== "string") return str;
+    return str.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  }
+
+  function daysFrom(value) {
+    if (!value) return null;
+    const t = typeof value === "number" ? value : Date.parse(value);
+    if (!Number.isFinite(t)) return null;
+    return Math.floor((Date.now() - t) / 86400000);
+  }
+
+  function fmtMoney(n) {
+    return typeof n === "number" ? `$${n.toLocaleString()}` : "N/A";
+  }
+
+  function snapFloor(x) {
+    return Math.floor(x / STEP) * STEP;
+  }
+
+  function randomDelay(min = 200, max = 350) {
+    return new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
+  }
+
+  // ---- DOM Helpers ----
 
   function ensureStyle() {
     if (document.getElementById("ahx_style_stable")) return;
@@ -47,7 +83,7 @@
       }
       #${PANEL_ID} button:disabled{opacity:.6;cursor:default;}
     `;
-    document.documentElement.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
   }
 
   function ensurePanel() {
@@ -61,24 +97,19 @@
     return el;
   }
 
-  function daysFrom(value) {
-    if (!value) return null;
-    const t = typeof value === "number" ? value : Date.parse(value);
-    if (!Number.isFinite(t)) return null;
-    return Math.floor((Date.now() - t) / 86400000);
+  function panelTemplate(bodyHtml) {
+    return `
+      <div class="ahx-header"><div>Allhomes Extra</div><div class="ahx-toggle" id="ahx_toggle">–</div></div>
+      <div class="ahx-body" id="ahx_body">${bodyHtml}</div>
+    `;
   }
 
-  function fmtMoney(n) {
-    if (typeof n !== "number") return "N/A";
-    return `$${n.toLocaleString()}`;
-  }
+  // ---- Data Extraction ----
 
-  // ---- Street locality slug (robust) ----
   function findStreetSlugInObject(root) {
     const seen = new Set();
     function walk(x) {
-      if (!x || typeof x !== "object") return null;
-      if (seen.has(x)) return null;
+      if (!x || typeof x !== "object" || seen.has(x)) return null;
       seen.add(x);
       if (x.type === "STREET" && typeof x.slug === "string" && x.slug.length > 3) return x.slug;
       for (const k of Object.keys(x)) {
@@ -100,13 +131,11 @@
       if (i < parts.length && /^\d+$/.test(parts[i])) i++;
       return parts.slice(i).join("-");
     }
-    const rest = /^\d+$/.test(parts[0]) ? parts.slice(1) : parts;
-    return rest.join("-");
+    return (/^\d+$/.test(parts[0]) ? parts.slice(1) : parts).join("-");
   }
 
   function getStreetLocalitySlug(app) {
-    const root = app?.body?.property;
-    return findStreetSlugInObject(root) || getStreetSlugFallbackFromPathname();
+    return findStreetSlugInObject(app?.body?.property) || getStreetSlugFallbackFromPathname();
   }
 
   function getTargetListingId(app) {
@@ -116,7 +145,11 @@
     return null;
   }
 
-  async function postSearch({ min, max, streetSlug }) {
+  // ---- Search API ----
+
+  async function postSearch({ min, max, streetSlug }, retryCount = 0) {
+    await randomDelay();
+
     const payload = {
       sort: { criteria: "AUCTION", order: "ASC" },
       page: 1,
@@ -127,40 +160,37 @@
         localities: [{ type: "STREET", slug: streetSlug }],
       },
     };
-
     const res = await fetch(SEARCH_ENDPOINT, {
       method: "POST",
       credentials: "include",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
+
+    if ((res.status === 429 || res.status === 503) && retryCount < 1) {
+      await randomDelay(1000, 2000);
+      return postSearch({ min, max, streetSlug }, retryCount + 1);
+    }
+
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    return res.json();
   }
 
   function containsTarget(searchJson, targetId) {
     const tid = String(targetId);
     const arr = searchJson?.searchResults;
-    if (!Array.isArray(arr)) return false;
-    return arr.some((r) => String(r?.listing?.id) === tid);
+    return Array.isArray(arr) && arr.some((r) => String(r?.listing?.id) === tid);
   }
 
-  function snapFloor(x) {
-    return Math.floor(x / STEP) * STEP;
-  }
+  // ---- Boundary Search (binary search for price range) ----
 
-  // upper side: find largest min that still includes target
-  async function findUpperByMin({ targetId, streetSlug, setStatus }) {
-    setStatus(`(Upper) check min=${RANGE_LOW.toLocaleString()}…`);
-    const lowJson = await postSearch({ min: RANGE_LOW, max: RANGE_HIGH, streetSlug });
-    if (!containsTarget(lowJson, targetId)) return { ok: false, message: "Target not found (slug mismatch?)" };
+  async function findUpperByMin({ targetId, streetSlug, setStatus, wideJson }) {
+    if (!containsTarget(wideJson, targetId)) return { ok: false, message: "Target not found (slug mismatch?)" };
 
-    setStatus(`(Upper) check min=${RANGE_HIGH.toLocaleString()}…`);
-    const highJson = await postSearch({ min: RANGE_HIGH, max: RANGE_HIGH, streetSlug });
-    if (containsTarget(highJson, targetId)) return { ok: false, message: "Still present at upper bound (>1.5M?)" };
-
+    // Binary search: find largest min where listing appears
+    // lo = present side (confirmed by wideJson), hi = absent side
     let lo = snapFloor(RANGE_LOW);
-    let hi = snapFloor(RANGE_HIGH);
+    let hi = snapFloor(RANGE_HIGH) + STEP;
 
     while (lo + STEP < hi) {
       const mid = snapFloor((lo + hi) / 2);
@@ -170,91 +200,139 @@
       else hi = mid;
     }
 
+    // lo is the largest min where listing appears (= upper price at 10k precision)
+    const atUpperBound = lo >= RANGE_HIGH;
     return {
       ok: true,
       presentAt: lo,
-      absentAt: lo + STEP,
-      evidence: `present@${lo.toLocaleString()} absent@${(lo + STEP).toLocaleString()}`,
+      absentAt: atUpperBound ? null : hi,
+      evidence: atUpperBound ? `present@${lo.toLocaleString()} (at or above upper bound)` : `present@${lo.toLocaleString()} absent@${hi.toLocaleString()}`,
     };
   }
 
-  // lower side: find smallest max that still includes target
-  async function findLowerByMax({ targetId, streetSlug, setStatus }) {
-    setStatus(`(Lower) check max=${RANGE_HIGH.toLocaleString()}…`);
-    const wide = await postSearch({ min: RANGE_LOW, max: RANGE_HIGH, streetSlug });
-    if (!containsTarget(wide, targetId)) return { ok: false, message: "Target not found (slug mismatch?)" };
+  async function findLowerByMax({ targetId, streetSlug, setStatus, wideJson, upperBound }) {
+    if (!containsTarget(wideJson, targetId)) return { ok: false, message: "Target not found (slug mismatch?)" };
 
-    setStatus(`(Lower) check max=${RANGE_LOW.toLocaleString()}…`);
-    const tooLow = await postSearch({ min: RANGE_LOW, max: RANGE_LOW, streetSlug });
-    if (containsTarget(tooLow, targetId)) {
-      return {
-        ok: true,
-        presentAt: RANGE_LOW,
-        absentAt: null,
-        evidence: `present@${RANGE_LOW.toLocaleString()} (range may start <= ${RANGE_LOW.toLocaleString()})`,
-      };
-    }
-
-    let lo = snapFloor(RANGE_LOW); // absent side
-    let hi = snapFloor(RANGE_HIGH); // present side
+    // Binary search: find smallest max where listing appears
+    // lo = absent side, hi = present side (confirmed by wideJson)
+    let lo = snapFloor(RANGE_LOW) - STEP;
+    let hi = snapFloor(upperBound);
 
     while (lo + STEP < hi) {
       const mid = snapFloor((lo + hi) / 2);
       setStatus(`(Lower) max=${mid.toLocaleString()}…`);
       const j = await postSearch({ min: RANGE_LOW, max: mid, streetSlug });
-      if (containsTarget(j, targetId)) hi = mid; // try smaller max
-      else lo = mid; // need larger max
+      if (containsTarget(j, targetId)) hi = mid;
+      else lo = mid;
     }
 
+    // hi is the smallest max where listing appears
+    const atLowerBound = hi <= RANGE_LOW;
     return {
       ok: true,
       presentAt: hi,
-      absentAt: hi - STEP,
-      evidence: `absent@${(hi - STEP).toLocaleString()} present@${hi.toLocaleString()}`,
+      absentAt: atLowerBound ? null : lo,
+      evidence: atLowerBound ? `present@${hi.toLocaleString()} (at or below lower bound)` : `absent@${lo.toLocaleString()} present@${hi.toLocaleString()}`,
     };
   }
 
   async function runBoth({ targetId, streetSlug, setStatus }) {
-    const upper = await findUpperByMin({ targetId, streetSlug, setStatus });
-    if (!upper.ok) return { ok: false, message: upper.message };
+    // Single wide check for both searches (de-duplicated)
+    setStatus(`Checking presence in ${RANGE_LOW_STR}–${RANGE_HIGH_STR}…`);
+    const wideJson = await postSearch({ min: RANGE_LOW, max: RANGE_HIGH, streetSlug });
 
-    const lower = await findLowerByMax({ targetId, streetSlug, setStatus });
+    // Step 1: Find lower bound first (smallest max where listing appears)
+    const lower = await findLowerByMax({ targetId, streetSlug, setStatus, wideJson, upperBound: RANGE_HIGH });
     if (!lower.ok) return { ok: false, message: lower.message };
 
-    // 10k precision display:
-    // lower.presentAt is the first 10k max that includes target => lower edge ≈ lower.presentAt - STEP + ???,
-    // but per your requirement we just show the tested 10k boundaries.
+    // Step 2: min+1 probe - check if price extends above lower bound
+    setStatus(`(Probe) min=${lower.presentAt + 1}…`);
+    const minProbeJson = await postSearch({ min: lower.presentAt + 1, max: RANGE_HIGH, streetSlug });
+
+    if (!containsTarget(minProbeJson, targetId)) {
+      // Price does not extend above lower.presentAt
+      // Now check if price is exactly lower.presentAt or somewhere in (lower-STEP, lower)
+      setStatus(`(Probe) max=${lower.presentAt - 1}…`);
+      const maxProbeJson = await postSearch({ min: RANGE_LOW, max: lower.presentAt - 1, streetSlug });
+
+      if (!containsTarget(maxProbeJson, targetId)) {
+        // Price is exactly lower.presentAt (single number)
+        return {
+          ok: true,
+          lowerMaxPresent: lower.presentAt,
+          upperMinPresent: lower.presentAt,
+          evidence: {
+            lower: lower.evidence,
+            upper: `exact@${lower.presentAt.toLocaleString()} (max-1 probe: absent)`,
+          },
+        };
+      } else {
+        // Price is in range (lower-STEP, lower), show as 10k range
+        return {
+          ok: true,
+          lowerMaxPresent: lower.absentAt ?? lower.presentAt - STEP,
+          upperMinPresent: lower.presentAt,
+          evidence: {
+            lower: lower.evidence,
+            upper: `range (max-1 probe: present@${(lower.presentAt - 1).toLocaleString()})`,
+          },
+        };
+      }
+    }
+
+    // Step 3: Price is a range, find upper bound (narrow search using lower bound)
+    const upper = await findUpperByMin({ targetId, streetSlug, setStatus, wideJson });
+    if (!upper.ok) return { ok: false, message: upper.message };
+
+    // Step 4: min+1 probe on upper to check if upper is exact 10k-aligned
+    setStatus(`(Probe) min=${upper.presentAt + 1}…`);
+    const upperProbeJson = await postSearch({ min: upper.presentAt + 1, max: RANGE_HIGH, streetSlug });
+
+    let finalUpper = upper.absentAt ?? upper.presentAt + STEP;
+    let upperEvidence = upper.evidence;
+
+    if (!containsTarget(upperProbeJson, targetId)) {
+      // Upper is exactly upper.presentAt (10k-aligned)
+      finalUpper = upper.presentAt;
+      upperEvidence = `exact@${upper.presentAt.toLocaleString()} (min+1 probe: absent)`;
+    }
+
     return {
       ok: true,
-      lowerMaxPresent: lower.presentAt, // e.g. 880,000 means max must be >= 880,000
-      upperMinPresent: upper.presentAt, // e.g. 920,000 means min can be up to 920,000
-      evidence: { lower: lower.evidence, upper: upper.evidence },
+      lowerMaxPresent: lower.presentAt,
+      upperMinPresent: finalUpper,
+      evidence: { lower: lower.evidence, upper: upperEvidence },
     };
   }
 
-  function render() {
-    const el = ensurePanel();
-    const app = window["__domain_group/APP_PROPS"];
+  // ---- Rendering ----
 
-    if (!app) {
-      el.innerHTML = `
-        <div class="ahx-header"><div>Allhomes Extra</div><div class="ahx-toggle" id="ahx_toggle">–</div></div>
-        <div class="ahx-body" id="ahx_body"><div class="k">Waiting for data…</div></div>
-      `;
-      bindToggle(el);
-      return;
+  function renderHistory(history) {
+    if (!Array.isArray(history) || !history.length) {
+      return `<div class="k">priceHistory:</div><div>Not found</div>`;
     }
+    const items = history
+      .map((h) => {
+        const t = h.transfer || {};
+        const label = escapeHtml(t.label ?? "Event");
+        return `
+        <div style="margin-top:4px">
+          • ${label} (${escapeHtml(h.date?.slice(0, 10) ?? "N/A")})
+          <div style="margin-left:10px">
+            soldPrice: ${typeof t.price === "number" ? fmtMoney(t.price) : "N/A"}<br>
+            contract: ${escapeHtml(t.contractDate?.slice(0, 10) ?? "N/A")}<br>
+            transfer: ${escapeHtml(t.transferDate?.slice(0, 10) ?? "N/A")}
+          </div>
+        </div>
+      `;
+      })
+      .join("");
+    return `<div class="k">priceHistory:</div>${items}`;
+  }
 
+  function renderListingBody(app) {
     const listing = app?.body?.property?.listing;
     const history = app?.body?.property?.history || [];
-    if (!listing) {
-      el.innerHTML = `
-        <div class="ahx-header"><div>Allhomes Extra</div><div class="ahx-toggle" id="ahx_toggle">–</div></div>
-        <div class="ahx-body" id="ahx_body"><div class="k">Listing not ready</div></div>
-      `;
-      bindToggle(el);
-      return;
-    }
 
     const datePostedVal = listing.publicVisibleDate;
     const relistedDateVal = listing.relistedDate;
@@ -269,54 +347,19 @@
       price = `$${listing.priceLower.toLocaleString()} – $${listing.priceUpper.toLocaleString()}`;
     }
 
-    let historyHtml = `<div class="k">priceHistory:</div><div>Not found</div>`;
-    if (Array.isArray(history) && history.length) {
-      historyHtml =
-        `<div class="k">priceHistory:</div>` +
-        history
-          .map((h) => {
-            const t = h.transfer || {};
-            const label = t.label ?? "Event";
-            return `
-            <div style="margin-top:4px">
-              • ${label} (${h.date?.slice(0, 10) ?? "N/A"})
-              <div style="margin-left:10px">
-                soldPrice: ${typeof t.price === "number" ? fmtMoney(t.price) : "N/A"}<br>
-                contract: ${t.contractDate?.slice(0, 10) ?? "N/A"}<br>
-                transfer: ${t.transferDate?.slice(0, 10) ?? "N/A"}
-              </div>
-            </div>
-          `;
-          })
-          .join("");
-    }
-
-    const targetId = getTargetListingId(app);
-    const streetSlug = getStreetLocalitySlug(app);
-
-    el.innerHTML = `
-      <div class="ahx-header">
-        <div>Allhomes Extra</div>
-        <div class="ahx-toggle" id="ahx_toggle">–</div>
-      </div>
-      <div class="ahx-body" id="ahx_body">
-        <div><span class="k">datePosted:</span> ${datePosted}</div>
-        <div><span class="k">relistedDate:</span> ${relistedDate}</div>
-        <div><span class="k">pageViews:</span> ${pageViews}</div>
-        <div><span class="k">price:</span> ${price}</div>
-        <div style="margin-top:6px">${historyHtml}</div>
-
-        <div style="margin-top:10px;border-top:1px solid rgba(0,0,0,.08);padding-top:8px">
-          <div class="k">filterPrice (inferred):</div>
-          <div id="ahx_fp_result" class="mono">Not run</div>
-          <button id="ahx_fp_btn">Run boundary test (both)</button>
-          <div id="ahx_fp_status" class="small"></div>
-        </div>
+    return `
+      <div><span class="k">datePosted:</span> ${escapeHtml(datePosted)}</div>
+      <div><span class="k">relistedDate:</span> ${escapeHtml(relistedDate)}</div>
+      <div><span class="k">pageViews:</span> ${escapeHtml(String(pageViews))}</div>
+      <div><span class="k">price:</span> ${escapeHtml(String(price))}</div>
+      <div style="margin-top:6px">${renderHistory(history)}</div>
+      <div style="margin-top:10px;border-top:1px solid rgba(0,0,0,.08);padding-top:8px">
+        <div class="k">filterPrice (inferred):</div>
+        <div id="ahx_fp_result" class="mono">Not run</div>
+        <button id="ahx_fp_btn">Run boundary test (both)</button>
+        <div id="ahx_fp_status" class="small"></div>
       </div>
     `;
-
-    bindToggle(el);
-    bindBoundary(el, { targetId, streetSlug });
   }
 
   function bindToggle(el) {
@@ -337,40 +380,91 @@
     if (!btn || !status || !result) return;
 
     btn.onclick = async () => {
+      const myRunId = ++currentRunId;
       btn.disabled = true;
       result.textContent = "Running…";
       status.textContent = "";
 
-      const setStatus = (s) => (status.textContent = s);
+      const setStatus = (s) => {
+        if (myRunId !== currentRunId || !el.isConnected) return;
+        status.textContent = s;
+      };
 
       try {
         const out = await runBoth({ targetId, streetSlug, setStatus });
+
+        // Guard against stale updates
+        if (myRunId !== currentRunId || !el.isConnected) return;
+
         if (!out.ok) {
           result.textContent = "N/A";
           status.textContent = out.message;
+        } else if (out.lowerMaxPresent === out.upperMinPresent) {
+          // Exact price locked
+          result.textContent = fmtMoney(out.lowerMaxPresent);
+          status.textContent = `locked: ${out.evidence.upper}`;
         } else {
-          // ✅ 10k precision display only
-          result.textContent = `${fmtMoney(out.lowerMaxPresent)} – ${fmtMoney(out.upperMinPresent + STEP)}`;
+          result.textContent = `${fmtMoney(out.lowerMaxPresent)} – ${fmtMoney(out.upperMinPresent)}`;
           status.textContent = `lower: ${out.evidence.lower} | upper: ${out.evidence.upper}`;
         }
       } catch (e) {
+        if (myRunId !== currentRunId || !el.isConnected) return;
         result.textContent = "N/A";
         status.textContent = `Error: ${String(e)}`;
       } finally {
-        btn.disabled = false;
+        if (myRunId === currentRunId && el.isConnected) {
+          btn.disabled = false;
+        }
       }
     };
   }
 
-  let lastUrl = location.href;
+  function render() {
+    const el = ensurePanel();
+    const app = window["__domain_group/APP_PROPS"];
+
+    if (!app) {
+      el.innerHTML = panelTemplate(`<div class="k">Waiting for data…</div>`);
+      bindToggle(el);
+      lastListingId = null;
+      return;
+    }
+
+    const listing = app?.body?.property?.listing;
+    if (!listing) {
+      el.innerHTML = panelTemplate(`<div class="k">Listing not ready</div>`);
+      bindToggle(el);
+      lastListingId = null;
+      return;
+    }
+
+    const targetId = getTargetListingId(app);
+
+    // Short-circuit if same listing already rendered
+    if (targetId && targetId === lastListingId && el.querySelector("#ahx_fp_btn")) {
+      return;
+    }
+    lastListingId = targetId;
+
+    const streetSlug = getStreetLocalitySlug(app);
+
+    el.innerHTML = panelTemplate(renderListingBody(app));
+    bindToggle(el);
+    bindBoundary(el, { targetId, streetSlug });
+  }
+
+  // ---- Initialization ----
+
   setInterval(() => {
     if (location.pathname.startsWith("/sale/search")) {
       const existing = document.getElementById(PANEL_ID);
       if (existing) existing.remove();
+      lastListingId = null;
       return;
     }
     if (location.href !== lastUrl) {
       lastUrl = location.href;
+      lastListingId = null;
       render();
     }
     if (!document.getElementById(PANEL_ID)) render();
