@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.10.0
+// @version      0.12.0
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      suggest.realestate.com.au
+// @connect      www.property.com.au
 // ==/UserScript==
 
 (function () {
@@ -84,6 +86,138 @@
 
   function randomDelay(min = 200, max = 350) {
     return new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
+  }
+
+  // ---- Property.com.au Enrichment ----
+
+  function gmFetch(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest === "undefined") {
+        reject(new Error("GM_xmlhttpRequest not available - check Tampermonkey grants"));
+        return;
+      }
+      try {
+        GM_xmlhttpRequest({
+          method: options.method || "GET",
+          url,
+          headers: options.headers || {},
+          data: options.body || null,
+          onload: (res) =>
+            resolve({
+              ok: res.status >= 200 && res.status < 300,
+              status: res.status,
+              text: () => Promise.resolve(res.responseText),
+              json: () => Promise.resolve(JSON.parse(res.responseText)),
+            }),
+          onerror: (err) => reject(new Error("Network error: " + (err?.error || "unknown"))),
+          ontimeout: () => reject(new Error("Request timeout")),
+        });
+      } catch (e) {
+        reject(new Error("GM_xmlhttpRequest failed: " + e.message));
+      }
+    });
+  }
+
+  function getAddressFromApp(app) {
+    const addr = app?.body?.property?.address;
+    if (!addr) return null;
+    // Allhomes provides formattedFull: "18/15 Bowman Street, Macquarie ACT 2614"
+    return addr.formattedFull || null;
+  }
+
+  async function fetchPropertyInfo(address) {
+    const url = `https://suggest.realestate.com.au/consumer-suggest/suggestions?max=1&type=address&src=homepage&query=${encodeURIComponent(address)}`;
+    const res = await gmFetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const suggestion = data?._embedded?.suggestions?.[0];
+    if (!suggestion?.id || !suggestion?.source) return null;
+
+    const src = suggestion.source;
+    const id = suggestion.id;
+
+    // Build slug: {state}/{suburb}-{postcode}/{street}-{streetType}/{streetNumber}-pid-{id}/
+    const state = (src.state || "").toLowerCase();
+    const suburb = (src.suburb || "").toLowerCase().replace(/\s+/g, "-");
+    const postcode = src.postcode || "";
+    const street = (src.street || "").toLowerCase();
+    const streetType = (src.streetType || "").toLowerCase();
+    const streetNumber = (src.streetNumber || "").replace(/\//g, "-");
+
+    return `${state}/${suburb}-${postcode}/${street}-${streetType}/${streetNumber}-pid-${id}/`;
+  }
+
+  function parsePropertyHtml(html) {
+    const result = { avm: null, rental: null };
+
+    // Extract sale estimate from valueEstimatesV2.estimates.sale section (display values)
+    const saleSection = html.match(/\\*"sale\\*":\{.{0,2000}?\\*"__typename\\*":\\*"PropertyPage_PropTrackValueEstimateSale/);
+    if (saleSection) {
+      const section = saleSection[0];
+      const valueMatch = section.match(/\\*"price\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const confMatch = section.match(/\\*"confidence\\*":\{\\*"type\\*":\\*"(\w+)/);
+      const maxMatch = section.match(/\\*"range\\*":\{\\*"max\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const minMatch = section.match(/\\*"min\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const subtitleMatch = section.match(/\\*"subtitle\\*":\\*"([^\\]+)\\*/);
+
+      if (valueMatch) {
+        result.avm = {
+          value: parseInt(valueMatch[1], 10),
+          low: minMatch ? parseInt(minMatch[1], 10) : null,
+          high: maxMatch ? parseInt(maxMatch[1], 10) : null,
+          confidence: confMatch ? confMatch[1] : null,
+          date: subtitleMatch ? subtitleMatch[1].replace("Last updated ", "") : null,
+        };
+      }
+    }
+
+    // Extract rental data from the rental section
+    const rentalSection = html.match(/\\*"rental\\*":\{.{0,2000}?\\*"__typename\\*":\\*"PropertyPage_PropTrackValueEstimateRental/);
+    if (rentalSection) {
+      const section = rentalSection[0];
+      const valueMatch = section.match(/\\*"price\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const confMatch = section.match(/\\*"confidence\\*":\{\\*"type\\*":\\*"(\w+)/);
+      const maxMatch = section.match(/\\*"range\\*":\{\\*"max\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const minMatch = section.match(/\\*"min\\*":\{[^}]*\\*"value\\*":(\d+)/);
+      const subtitleMatch = section.match(/\\*"subtitle\\*":\\*"([^\\]+)\\*/);
+
+      if (valueMatch) {
+        result.rental = {
+          value: parseInt(valueMatch[1], 10),
+          confidence: confMatch ? confMatch[1] : null,
+          min: minMatch ? parseInt(minMatch[1], 10) : null,
+          max: maxMatch ? parseInt(maxMatch[1], 10) : null,
+          date: subtitleMatch ? subtitleMatch[1].replace("Last updated ", "") : null,
+        };
+      }
+    }
+
+    return result;
+  }
+
+  async function fetchPropertyData(app, setStatus) {
+    const address = getAddressFromApp(app);
+    if (!address) return { ok: false, message: "Could not extract address" };
+
+    setStatus("Resolving property…");
+    const slug = await fetchPropertyInfo(address);
+    if (!slug) return { ok: false, message: "Property not found" };
+
+    setStatus("Fetching valuation data…");
+    const pageUrl = `https://www.property.com.au/${slug}`;
+    const res = await gmFetch(pageUrl);
+    if (!res.ok) {
+      const hint =
+        res.status === 429 || res.status === 403 ? ' – open this <a href="https://www.property.com.au" target="_blank">link</a>, close it, then retry' : "";
+      return { ok: false, message: `Failed to fetch (${res.status})${hint}` };
+    }
+
+    const html = await res.text();
+    const data = parsePropertyHtml(html);
+
+    if (!data.avm && !data.rental) return { ok: false, message: "No valuation data found in page" };
+
+    return { ok: true, data, url: pageUrl };
   }
 
   // ---- DOM Helpers ----
@@ -444,6 +578,12 @@
         <button id="ahx_fp_btn">Run boundary test (both)</button>
         <div id="ahx_fp_status" class="small"></div>
       </div>
+      <div style="margin-top:10px;border-top:1px solid rgba(0,0,0,.08);padding-top:8px">
+        <div class="k">Property.com.au Estimate: <span id="ahx_pca_link"></span></div>
+        <div id="ahx_pca_result" class="mono">Not run</div>
+        <button id="ahx_pca_btn">Fetch valuation</button>
+        <div id="ahx_pca_status" class="small"></div>
+      </div>
     `;
   }
 
@@ -525,9 +665,78 @@
     };
   }
 
+  function bindPropertyComAu(el, app) {
+    const btn = el.querySelector("#ahx_pca_btn");
+    const status = el.querySelector("#ahx_pca_status");
+    const result = el.querySelector("#ahx_pca_result");
+    if (!btn || !status || !result) return;
+
+    btn.onclick = async () => {
+      const myRunId = ++currentRunId;
+      btn.disabled = true;
+      result.innerHTML = "Fetching…";
+      status.textContent = "";
+
+      const setStatus = (s) => {
+        if (myRunId !== currentRunId || !el.isConnected) return;
+        status.textContent = s;
+      };
+
+      try {
+        const out = await fetchPropertyData(app, setStatus);
+
+        if (myRunId !== currentRunId || !el.isConnected) return;
+
+        if (!out.ok) {
+          result.textContent = "N/A";
+          status.innerHTML = out.message;
+        } else {
+          const { avm, rental } = out.data;
+          let html = "";
+
+          const fmtDate = (d) => {
+            if (!d) return null;
+            const parsed = Date.parse(d);
+            if (!Number.isFinite(parsed)) return d;
+            return new Date(parsed).toLocaleDateString("en-AU", { day: "numeric", month: "short" });
+          };
+
+          if (avm) {
+            const conf = avm.confidence ? ` (${avm.confidence})` : "";
+            const range = avm.low && avm.high ? `<br><span class="small">Range: ${fmtMoney(avm.low)} – ${fmtMoney(avm.high)}</span>` : "";
+            const date = avm.date ? `<br><span class="small">Updated: ${fmtDate(avm.date)}</span>` : "";
+            html += `<div><strong>Value:</strong> ${fmtMoney(avm.value)}${conf}${range}${date}</div>`;
+          }
+
+          if (rental) {
+            const conf = rental.confidence ? ` (${rental.confidence})` : "";
+            const range = rental.min && rental.max ? `<br><span class="small">Range: $${rental.min} – $${rental.max}/wk</span>` : "";
+            const date = rental.date ? `<br><span class="small">Updated: ${rental.date}</span>` : "";
+            html += `<div style="margin-top:4px"><strong>Rental:</strong> $${rental.value}/wk${conf}${range}${date}</div>`;
+          }
+
+          result.innerHTML = html || "No data";
+          status.textContent = "";
+          const link = el.querySelector("#ahx_pca_link");
+          if (link) {
+            link.innerHTML = `<a href="${escapeHtml(out.url)}" target="_blank" style="color:#0066cc">(link)</a>`;
+          }
+        }
+      } catch (e) {
+        if (myRunId !== currentRunId || !el.isConnected) return;
+        result.textContent = "N/A";
+        status.textContent = `Error: ${String(e)}`;
+      } finally {
+        if (myRunId === currentRunId && el.isConnected) {
+          btn.disabled = false;
+        }
+      }
+    };
+  }
+
   function render() {
     const el = ensurePanel();
-    const app = window["__domain_group/APP_PROPS"];
+    const app = (typeof unsafeWindow !== "undefined" ? unsafeWindow : window)["__domain_group/APP_PROPS"];
 
     if (!app) {
       el.innerHTML = panelTemplate(`<div class="k">Waiting for data…</div>`);
@@ -558,6 +767,7 @@
     el.innerHTML = panelTemplate(renderListingBody(app));
     bindToggle(el);
     bindBoundary(el, { targetId, streetSlug, history });
+    bindPropertyComAu(el, app);
   }
 
   // ---- Initialization ----
