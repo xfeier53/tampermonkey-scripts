@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.8.0
+// @version      0.9.0
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        none
@@ -158,6 +158,7 @@
       filters: {
         price: { min, max },
         localities: [{ type: "STREET", slug: streetSlug }],
+        propertyStatus: ["FOR_SALE", "UNDER_OFFER", "SOLD"],
       },
     };
     const res = await fetch(SEARCH_ENDPOINT, {
