@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.9.0
+// @version      0.10.0
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        none
@@ -43,6 +43,39 @@
 
   function fmtMoney(n) {
     return typeof n === "number" ? `$${n.toLocaleString()}` : "N/A";
+  }
+
+  function calcAnnualGrowth(prevPrice, prevDate, currPrice, currDate) {
+    if (typeof prevPrice !== "number" || typeof currPrice !== "number") return null;
+    if (!prevDate || !currDate) return null;
+    const t1 = typeof prevDate === "number" ? prevDate : Date.parse(prevDate);
+    const t2 = typeof currDate === "number" ? currDate : Date.parse(currDate);
+    if (!Number.isFinite(t1) || !Number.isFinite(t2)) return null;
+    const years = (t2 - t1) / (365 * 24 * 60 * 60 * 1000);
+    if (years <= 0) return null;
+    const ratio = currPrice / prevPrice;
+    if (ratio <= 0) return null;
+    const cagr = (Math.pow(ratio, 1 / years) - 1) * 100;
+    return cagr;
+  }
+
+  function fmtGrowth(pct) {
+    if (pct === null || !Number.isFinite(pct)) return "";
+    const sign = pct >= 0 ? "+" : "";
+    return ` (${sign}${pct.toFixed(1)}%/yr)`;
+  }
+
+  function fmtElapsed(dateStr) {
+    if (!dateStr) return "";
+    const t = Date.parse(dateStr);
+    if (!Number.isFinite(t)) return "";
+    const years = (Date.now() - t) / (365 * 24 * 60 * 60 * 1000);
+    if (years < 0) return "";
+    if (years < 1) {
+      const months = Math.round(years * 12);
+      return ` (${months} mo)`;
+    }
+    return ` (${years.toFixed(1)} yrs)`;
   }
 
   function snapFloor(x) {
@@ -310,25 +343,56 @@
 
   function renderHistory(history) {
     if (!Array.isArray(history) || !history.length) {
-      return `<div class="k">priceHistory:</div><div>Not found</div>`;
+      return `<div class="k">Price History:</div><div>Not found</div>`;
     }
+
+    // Build list of sold entries with prices for comparison
+    const soldEntries = history.map((h, i) => ({ index: i, price: h.transfer?.price, date: h.date })).filter((e) => typeof e.price === "number");
+
     const items = history
-      .map((h) => {
+      .map((h, i) => {
         const t = h.transfer || {};
         const label = escapeHtml(t.label ?? "Event");
+        const currPrice = t.price;
+        const currDate = h.date;
+
+        // Find previous sold entry (earlier in array = more recent, so look for higher index)
+        let growthStr = "";
+        if (typeof currPrice === "number") {
+          const prevEntry = soldEntries.find((e) => e.index > i && typeof e.price === "number");
+          if (prevEntry) {
+            const pct = calcAnnualGrowth(prevEntry.price, prevEntry.date, currPrice, currDate);
+            growthStr = fmtGrowth(pct);
+          }
+        }
+
+        const contractElapsed = fmtElapsed(t.contractDate);
+        const transferElapsed = fmtElapsed(t.transferDate);
+
         return `
         <div style="margin-top:4px">
-          • ${label} (${escapeHtml(h.date?.slice(0, 10) ?? "N/A")})
+          • ${label}
           <div style="margin-left:10px">
-            soldPrice: ${typeof t.price === "number" ? fmtMoney(t.price) : "N/A"}<br>
-            contract: ${escapeHtml(t.contractDate?.slice(0, 10) ?? "N/A")}<br>
-            transfer: ${escapeHtml(t.transferDate?.slice(0, 10) ?? "N/A")}
+            Sold Price: ${typeof currPrice === "number" ? fmtMoney(currPrice) + growthStr : "N/A"}<br>
+            Contract: ${escapeHtml(t.contractDate?.slice(0, 10) ?? "N/A")}${contractElapsed}<br>
+            Transfer: ${escapeHtml(t.transferDate?.slice(0, 10) ?? "N/A")}${transferElapsed}
           </div>
         </div>
       `;
       })
       .join("");
-    return `<div class="k">priceHistory:</div>${items}`;
+    return `<div class="k">Price History:</div>${items}`;
+  }
+
+  function getLastSoldEntry(history) {
+    if (!Array.isArray(history)) return null;
+    for (const h of history) {
+      const t = h.transfer || {};
+      if (typeof t.price === "number" && h.date) {
+        return { price: t.price, date: h.date };
+      }
+    }
+    return null;
   }
 
   function renderListingBody(app) {
@@ -344,18 +408,38 @@
     const pageViews = listing.pageViews ?? "N/A";
 
     let price = listing.price ?? "N/A";
+    const lastSold = getLastSoldEntry(history);
     if (typeof listing.priceLower === "number" && typeof listing.priceUpper === "number") {
-      price = `$${listing.priceLower.toLocaleString()} – $${listing.priceUpper.toLocaleString()}`;
+      if (listing.priceLower === listing.priceUpper) {
+        let growthStr = "";
+        if (lastSold) {
+          const pct = calcAnnualGrowth(lastSold.price, lastSold.date, listing.priceLower, Date.now());
+          growthStr = fmtGrowth(pct);
+        }
+        price = `$${listing.priceLower.toLocaleString()}${growthStr}`;
+      } else {
+        let growthStr = "";
+        if (lastSold) {
+          const pctLower = calcAnnualGrowth(lastSold.price, lastSold.date, listing.priceLower, Date.now());
+          const pctUpper = calcAnnualGrowth(lastSold.price, lastSold.date, listing.priceUpper, Date.now());
+          if (pctLower !== null && pctUpper !== null) {
+            const signL = pctLower >= 0 ? "+" : "";
+            const signU = pctUpper >= 0 ? "+" : "";
+            growthStr = ` (${signL}${pctLower.toFixed(1)}%, ${signU}${pctUpper.toFixed(1)}%/yr)`;
+          }
+        }
+        price = `$${listing.priceLower.toLocaleString()} – $${listing.priceUpper.toLocaleString()}${growthStr}`;
+      }
     }
 
     return `
-      <div><span class="k">datePosted:</span> ${escapeHtml(datePosted)}</div>
-      <div><span class="k">relistedDate:</span> ${escapeHtml(relistedDate)}</div>
-      <div><span class="k">pageViews:</span> ${escapeHtml(String(pageViews))}</div>
-      <div><span class="k">price:</span> ${escapeHtml(String(price))}</div>
+      <div><span class="k">Date Posted:</span> ${escapeHtml(datePosted)}</div>
+      <div><span class="k">Relisted Date:</span> ${escapeHtml(relistedDate)}</div>
+      <div><span class="k">Page Views:</span> ${escapeHtml(String(pageViews))}</div>
+      <div><span class="k">Price:</span> ${escapeHtml(String(price))}</div>
       <div style="margin-top:6px">${renderHistory(history)}</div>
       <div style="margin-top:10px;border-top:1px solid rgba(0,0,0,.08);padding-top:8px">
-        <div class="k">filterPrice (inferred):</div>
+        <div class="k">Filter Price (inferred):</div>
         <div id="ahx_fp_result" class="mono">Not run</div>
         <button id="ahx_fp_btn">Run boundary test (both)</button>
         <div id="ahx_fp_status" class="small"></div>
@@ -374,7 +458,7 @@
     };
   }
 
-  function bindBoundary(el, { targetId, streetSlug }) {
+  function bindBoundary(el, { targetId, streetSlug, history }) {
     const btn = el.querySelector("#ahx_fp_btn");
     const status = el.querySelector("#ahx_fp_status");
     const result = el.querySelector("#ahx_fp_result");
@@ -400,13 +484,34 @@
         if (!out.ok) {
           result.textContent = "N/A";
           status.textContent = out.message;
-        } else if (out.lowerMaxPresent === out.upperMinPresent) {
-          // Exact price locked
-          result.textContent = fmtMoney(out.lowerMaxPresent);
-          status.textContent = `locked: ${out.evidence.upper}`;
         } else {
-          result.textContent = `${fmtMoney(out.lowerMaxPresent)} – ${fmtMoney(out.upperMinPresent)}`;
-          status.textContent = `lower: ${out.evidence.lower} | upper: ${out.evidence.upper}`;
+          // Calculate growth compared to last sold price
+          const lastSold = getLastSoldEntry(history);
+
+          if (out.lowerMaxPresent === out.upperMinPresent) {
+            // Exact price locked
+            let growthStr = "";
+            if (lastSold) {
+              const pct = calcAnnualGrowth(lastSold.price, lastSold.date, out.lowerMaxPresent, Date.now());
+              growthStr = fmtGrowth(pct);
+            }
+            result.textContent = fmtMoney(out.lowerMaxPresent) + growthStr;
+            status.textContent = `locked: ${out.evidence.upper}`;
+          } else {
+            // Range - show growth for both bounds
+            let growthStr = "";
+            if (lastSold) {
+              const pctLower = calcAnnualGrowth(lastSold.price, lastSold.date, out.lowerMaxPresent, Date.now());
+              const pctUpper = calcAnnualGrowth(lastSold.price, lastSold.date, out.upperMinPresent, Date.now());
+              if (pctLower !== null && pctUpper !== null) {
+                const signL = pctLower >= 0 ? "+" : "";
+                const signU = pctUpper >= 0 ? "+" : "";
+                growthStr = ` (${signL}${pctLower.toFixed(1)}%, ${signU}${pctUpper.toFixed(1)}%/yr)`;
+              }
+            }
+            result.textContent = `${fmtMoney(out.lowerMaxPresent)} – ${fmtMoney(out.upperMinPresent)}${growthStr}`;
+            status.textContent = `lower: ${out.evidence.lower} | upper: ${out.evidence.upper}`;
+          }
         }
       } catch (e) {
         if (myRunId !== currentRunId || !el.isConnected) return;
@@ -448,10 +553,11 @@
     lastListingId = targetId;
 
     const streetSlug = getStreetLocalitySlug(app);
+    const history = app?.body?.property?.history || [];
 
     el.innerHTML = panelTemplate(renderListingBody(app));
     bindToggle(el);
-    bindBoundary(el, { targetId, streetSlug });
+    bindBoundary(el, { targetId, streetSlug, history });
   }
 
   // ---- Initialization ----
