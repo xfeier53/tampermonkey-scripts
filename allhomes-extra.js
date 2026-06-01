@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.12.0
+// @version      0.12.1
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -292,13 +292,13 @@
     const p = (location.pathname || "").replace(/^\/+/, "").split("?")[0];
     if (!p) return null;
     const parts = p.split("-");
-    if (parts[0] === "unit" || parts[0] === "level") {
-      let i = 1;
-      while (i < parts.length && /^\d+$/.test(parts[i])) i++;
-      if (i < parts.length && /^\d+$/.test(parts[i])) i++;
-      return parts.slice(i).join("-");
-    }
-    return (/^\d+$/.test(parts[0]) ? parts.slice(1) : parts).join("-");
+    // House-number-like token: 130, 130a, 5b, 1, etc. Also covers ranges like "1-3" (each segment matches).
+    const numLike = /^\d+[a-z]?$/i;
+    let i = 0;
+    if (parts[i] === "unit" || parts[i] === "level" || parts[i] === "lot" || parts[i] === "apartment") i++;
+    while (i < parts.length && numLike.test(parts[i])) i++;
+    if (i >= parts.length) return null;
+    return parts.slice(i).join("-");
   }
 
   function getStreetLocalitySlug(app) {
