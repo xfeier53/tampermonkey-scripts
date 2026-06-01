@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.12.1
+// @version      0.12.2
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -167,6 +167,25 @@
           high: maxMatch ? parseInt(maxMatch[1], 10) : null,
           confidence: confMatch ? confMatch[1] : null,
           date: subtitleMatch ? subtitleMatch[1].replace("Last updated ", "") : null,
+        };
+      }
+    }
+
+    // Fallback: newer property.com.au embeds the estimate in a tracking-data blob
+    // using avm_* fields (valueEstimatesV2 is often null now).
+    if (!result.avm) {
+      const valueMatch = html.match(/\\*"avm_estimated_value\\*":(\d+)/);
+      if (valueMatch) {
+        const lowMatch = html.match(/\\*"avm_low_range\\*":(\d+)/);
+        const highMatch = html.match(/\\*"avm_high_range\\*":(\d+)/);
+        const confMatch = html.match(/\\*"avm_confidence\\*":\\*"(\w+)/);
+        const dateMatch = html.match(/\\*"avm_last_updated_date\\*":\\*"([\d-]+)/);
+        result.avm = {
+          value: parseInt(valueMatch[1], 10),
+          low: lowMatch ? parseInt(lowMatch[1], 10) : null,
+          high: highMatch ? parseInt(highMatch[1], 10) : null,
+          confidence: confMatch ? confMatch[1] : null,
+          date: dateMatch ? dateMatch[1] : null,
         };
       }
     }
