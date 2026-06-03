@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.12.2
+// @version      0.12.3
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -16,8 +16,8 @@
 
   const PANEL_ID = "ahx_panel_stable";
   const SEARCH_ENDPOINT = "https://www.allhomes.com.au/wsvc/search/sale-residential";
-  const RANGE_LOW = 500000;
-  const RANGE_HIGH = 1500000;
+  const RANGE_LOW = 0;
+  const RANGE_HIGH = 5000000;
   const STEP = 10000;
 
   // Pre-computed formatted strings

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.4.0
+// @version      0.5.0
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -442,6 +442,8 @@
   }
 
   async function inferSearchPrice(listingId, address, setStatus) {
+    const RANGE_HIGH = 5000000; // search 0 – $5m
+    const STEP = 5000;
     const parts = parseAddressParts(address);
     if (!parts) return { ok: false, message: "Can't parse address" };
     const locality = streetLocality(parts);
@@ -449,17 +451,13 @@
     if (!(await listingPresentAtMin(listingId, locality, 0))) {
       return { ok: false, message: "Listing not found in street search" };
     }
-    // Bracket: double the min until the listing drops out.
     let lo = 0;
-    let hi = 50000;
-    while (await listingPresentAtMin(listingId, locality, hi)) {
-      lo = hi;
-      hi *= 2;
-      setStatus(`Bracketing… ${hi.toLocaleString()}`);
-      if (hi > 50000000) break;
+    let hi = RANGE_HIGH;
+    // Still present at the top of the range => price is at or above RANGE_HIGH.
+    if (await listingPresentAtMin(listingId, locality, hi)) {
+      return { ok: true, price: RANGE_HIGH, atOrAbove: true };
     }
     // Binary search the boundary (largest min where the listing still appears).
-    const STEP = 5000;
     while (hi - lo > STEP) {
       const mid = Math.round((lo + hi) / 2 / STEP) * STEP;
       if (mid <= lo || mid >= hi) break;
@@ -470,25 +468,37 @@
     return { ok: true, price: Math.round(lo / STEP) * STEP };
   }
 
-  function attachInfer(container, listingId, address) {
-    if (!container || !listingId || !address) return;
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `<button id="rex_infer_btn">Infer search price</button> <span id="rex_infer_result" class="small"></span>`;
-    container.appendChild(wrap);
-    const btn = wrap.querySelector("#rex_infer_btn");
-    const out = wrap.querySelector("#rex_infer_result");
+  function bindInfer(el, listingId, address) {
+    const btn = el.querySelector("#rex_infer_btn");
+    const status = el.querySelector("#rex_infer_status");
+    const result = el.querySelector("#rex_infer_result");
+    if (!btn || !status || !result) return;
+    if (!listingId || !address) {
+      btn.disabled = true;
+      result.textContent = "N/A";
+      return;
+    }
     btn.onclick = async () => {
       btn.disabled = true;
-      out.textContent = "Searching…";
+      result.textContent = "Running…";
+      status.textContent = "";
       try {
         const r = await inferSearchPrice(listingId, address, (s) => {
-          out.textContent = s;
+          status.textContent = s;
         });
-        if (r.ok) out.innerHTML = `<strong>${fmtMoney(r.price)}</strong> <span class="small">(search index)</span>`;
-        else out.textContent = r.message || "Not found";
+        if (r.ok) {
+          // Solved: show the price big + bold and keep the button disabled.
+          result.innerHTML = `<span style="font-size:18px;font-weight:700">${fmtMoney(r.price)}${r.atOrAbove ? "+" : ""}</span>`;
+          status.textContent = "locked (search index)";
+          btn.textContent = "Search price found";
+        } else {
+          result.textContent = "N/A";
+          status.textContent = r.message || "Not found";
+          btn.disabled = false;
+        }
       } catch (e) {
-        out.textContent = "Error: " + String(e);
-      } finally {
+        result.textContent = "N/A";
+        status.textContent = "Error: " + String(e);
         btn.disabled = false;
       }
     };
@@ -502,20 +512,22 @@
     style.id = "rex_style";
     style.textContent = `
       #${PANEL_ID}{
-        position:fixed;top:90px;right:16px;z-index:2147483647;width:320px;max-height:80vh;overflow:auto;
-        background:rgba(255,255,255,.98);color:#111;border:1px solid rgba(0,0,0,.15);border-radius:12px;
-        box-shadow:0 8px 30px rgba(0,0,0,.18);font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;
+        position:fixed;top:10px;left:10px;z-index:2147483647;
+        background:rgba(255,255,255,.96);
+        border:1px solid rgba(0,0,0,.2);
+        border-radius:10px;
+        font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI";
+        width:340px;max-width:44vw;max-height:90vh;overflow:auto;box-shadow:0 6px 18px rgba(0,0,0,.18);
       }
       #${PANEL_ID} .rex-header{
-        display:flex;justify-content:space-between;align-items:center;
+        display:flex;align-items:center;justify-content:space-between;
         padding:8px 10px;border-bottom:1px solid rgba(0,0,0,.08);font-weight:600;
-        background:#e4002b;color:#fff;border-radius:12px 12px 0 0;
       }
-      #${PANEL_ID} .rex-toggle{cursor:pointer;user-select:none;font-size:15px;line-height:1;}
+      #${PANEL_ID} .rex-toggle{cursor:pointer;user-select:none;font-size:14px;line-height:1;}
       #${PANEL_ID} .rex-body{padding:10px 12px;}
       #${PANEL_ID} .k{color:rgba(0,0,0,.55)}
       #${PANEL_ID} .small{font-size:11px;color:rgba(0,0,0,.6)}
-      #${PANEL_ID} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}
+      #${PANEL_ID} .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
       #${PANEL_ID} .sec{margin-top:10px;border-top:1px solid rgba(0,0,0,.08);padding-top:8px;}
       #${PANEL_ID} .big{font-size:15px;font-weight:600;}
       #${PANEL_ID} button{
@@ -593,21 +605,15 @@
   }
 
   function renderListingBody(L) {
-    let priceBlock;
     const range = parseRange(L.searchRange);
-    if (L.searchRange) {
-      priceBlock = `<div class="big">${escapeHtml(L.searchRange)}</div>
-        <div class="small">Display: ${escapeHtml(L.priceDisplay || "N/A")}${range ? ` · mid ${fmtMoney(range.mid)}` : ""}</div>`;
-    } else {
-      priceBlock = `<div class="big">${escapeHtml(L.priceDisplay || "N/A")}</div>
-        <div id="rex_infer_slot"></div>`;
-    }
+    const priceLine = L.searchRange
+      ? `${escapeHtml(L.searchRange)}${range ? ` <span class="small">(mid ${fmtMoney(range.mid)})</span>` : ""}`
+      : escapeHtml(L.priceDisplay || "N/A");
 
-    // Days on market from the hidden publishedDate.
     let listedLine = "N/A";
     if (L.publishedRaw) {
       const dom = daysFrom(L.publishedRaw);
-      listedLine = `${escapeHtml(L.publishedRaw)}${dom != null ? ` <span class="small">(${dom} days on market)</span>` : ""}`;
+      listedLine = `${escapeHtml(L.publishedRaw)}${dom != null ? ` (${dom} days)` : ""}`;
     }
 
     const viewsLine =
@@ -615,23 +621,26 @@
         ? `${escapeHtml(String(L.pageViews))}${L.viewsUpdated ? ` <span class="small">(as of ${String(L.viewsUpdated).slice(0, 10)})</span>` : ""}`
         : "N/A";
 
-    const tierLine = L.productDepth ? `<div><span class="k">Ad tier:</span> ${escapeHtml(String(L.productDepth))}</div>` : "";
+    const tierLine = L.productDepth ? `<div><span class="k">Ad Tier:</span> ${escapeHtml(String(L.productDepth))}</div>` : "";
 
     return `
-      <div class="k">Price guide (hidden search band):</div>
-      ${priceBlock}
+      <div><span class="k">Listed:</span> ${listedLine}</div>
+      <div><span class="k">Page Views:</span> ${viewsLine}</div>
+      ${tierLine}
+      <div><span class="k">Price:</span> ${priceLine}</div>
       <div class="sec">
-        <div><span class="k">Listed:</span> ${listedLine}</div>
-        <div><span class="k">Page views:</span> ${viewsLine}</div>
-        ${tierLine}
-      </div>
-      <div class="sec">
-        <div class="k">Sold history &amp; growth:</div>
+        <div class="k">Price History:</div>
         <div id="rex_hist_result" class="mono">Loading…</div>
         <div id="rex_hist_status" class="small"></div>
       </div>
       <div class="sec">
-        <div class="k">PropTrack estimate (property.com.au): <span id="rex_val_link"></span></div>
+        <div class="k">Search Price (inferred):</div>
+        <div id="rex_infer_result" class="mono">Not run</div>
+        <button id="rex_infer_btn">Infer search price</button>
+        <div id="rex_infer_status" class="small"></div>
+      </div>
+      <div class="sec">
+        <div class="k">Property.com.au Estimate: <span id="rex_val_link"></span></div>
         <div id="rex_val_result" class="mono">Not run</div>
         <button id="rex_val_btn">Fetch valuation</button>
         <div id="rex_val_status" class="small"></div>
@@ -776,33 +785,25 @@
     const L = extractListing(tree);
     el.innerHTML = panelTemplate(renderListingBody(L));
     bindToggle(el);
-    if (!L.searchRange) attachInfer(el.querySelector("#rex_infer_slot"), L.listingId, L.address);
     loadHistory(el, L.address, parseRange(L.searchRange));
+    bindInfer(el, L.listingId, L.address);
     bindValuation(el, L.address);
     return true;
   }
 
-  async function loadProfileBand(el, listingUrl, timeline, address) {
+  async function loadProfileBand(el, listingUrl, timeline) {
     const band = el.querySelector("#rex_band");
-    if (!band) return;
     const data = await fetchListingBand(listingUrl);
-    if (!data || !data.searchRange) {
-      band.textContent = (data && data.priceDisplay) || "N/A";
-      // No published band — offer to recover the indexed search price.
-      attachInfer(el.querySelector("#rex_infer_slot"), getIdFromUrl(listingUrl), address);
-      if (data && data.pageViews != null) {
-        const viewsEl = el.querySelector("#rex_views");
-        if (viewsEl) viewsEl.innerHTML = `<span class="k">Page views:</span> ${escapeHtml(String(data.pageViews))}${data.viewsUpdated ? ` <span class="small">(as of ${String(data.viewsUpdated).slice(0, 10)})</span>` : ""}`;
-      }
-      return;
-    }
-    const range = parseRange(data.searchRange);
-    band.textContent = data.searchRange;
+    if (band) band.textContent = (data && (data.searchRange || data.priceDisplay)) || "N/A";
     const viewsEl = el.querySelector("#rex_views");
-    if (viewsEl && data.pageViews != null) {
-      viewsEl.innerHTML = `<span class="k">Page views:</span> ${escapeHtml(String(data.pageViews))}${data.viewsUpdated ? ` <span class="small">(as of ${String(data.viewsUpdated).slice(0, 10)})</span>` : ""}`;
+    if (viewsEl) {
+      viewsEl.innerHTML =
+        data && data.pageViews != null
+          ? `${escapeHtml(String(data.pageViews))}${data.viewsUpdated ? ` <span class="small">(as of ${String(data.viewsUpdated).slice(0, 10)})</span>` : ""}`
+          : "N/A";
     }
     // Now that we have a guide mid, re-render the timeline with growth-vs-guide.
+    const range = data && parseRange(data.searchRange);
     const histEl = el.querySelector("#rex_profile_hist");
     if (histEl && range) histEl.innerHTML = renderTimeline(timeline, range);
   }
@@ -816,21 +817,29 @@
     }
     const P = extractProfile(pp);
 
-    const guideSection = P.listingUrl
-      ? `<div class="k">Price guide (hidden search band):</div>
-         <div id="rex_band" class="big">Loading…</div>
-         <div id="rex_infer_slot"></div>
-         <div id="rex_views"></div>`
-      : `<div class="k">Price guide:</div><div>No active listing</div>`;
+    const headLines = P.listingUrl
+      ? `<div><span class="k">Price:</span> <span id="rex_band">Loading…</span></div>
+         <div><span class="k">Page Views:</span> <span id="rex_views">…</span></div>`
+      : `<div><span class="k">Price:</span> No active listing</div>`;
+
+    const inferSection = P.listingUrl
+      ? `<div class="sec">
+           <div class="k">Search Price (inferred):</div>
+           <div id="rex_infer_result" class="mono">Not run</div>
+           <button id="rex_infer_btn">Infer search price</button>
+           <div id="rex_infer_status" class="small"></div>
+         </div>`
+      : "";
 
     const body = `
-      ${guideSection}
+      ${headLines}
       <div class="sec">
-        <div class="k">Sold history &amp; growth:</div>
+        <div class="k">Price History:</div>
         <div id="rex_profile_hist" class="mono">${renderTimeline(P.timeline, null)}</div>
       </div>
+      ${inferSection}
       <div class="sec">
-        <div class="k">PropTrack estimate (property.com.au): <span id="rex_val_link"></span></div>
+        <div class="k">Property.com.au Estimate: <span id="rex_val_link"></span></div>
         <div id="rex_val_result" class="mono">Not run</div>
         <button id="rex_val_btn">Fetch valuation</button>
         <div id="rex_val_status" class="small"></div>
@@ -839,7 +848,10 @@
     el.innerHTML = panelTemplate(body);
     bindToggle(el);
     bindValuation(el, P.address);
-    if (P.listingUrl) loadProfileBand(el, P.listingUrl, P.timeline, P.address);
+    if (P.listingUrl) {
+      bindInfer(el, getIdFromUrl(P.listingUrl), P.address);
+      loadProfileBand(el, P.listingUrl, P.timeline);
+    }
     return true;
   }
 
