@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.3.3
+// @version      0.4.0
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -399,6 +399,101 @@
     return timeline.find((e) => e.eventType === "sold" && typeof e.price === "number" && e.date) || null;
   }
 
+  // ---- Search-price inference (binary search on REA's search filter) ----
+  //
+  // Even "By Negotiation" / "Auction" listings with no published price band are
+  // indexed with a price so they appear in buyers' price-filtered searches. We
+  // recover that hidden price by probing the street-level search results and
+  // binary-searching the boundary where the listing drops out (allhomes-style).
+
+  function getIdFromUrl(u) {
+    const m = String(u || "").match(/-(\d+)\/?(?:$|\?|#)/);
+    return m ? m[1] : null;
+  }
+
+  // "18 Teague Street, Cook, ACT 2614" -> {street, suburb, state, postcode}
+  function parseAddressParts(full) {
+    const segs = String(full || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (segs.length < 3) return null;
+    const last = segs[segs.length - 1];
+    const suburb = segs[segs.length - 2];
+    const streetLine = segs.slice(0, segs.length - 2).join(" ");
+    const street = streetLine.replace(/^\D*\d[\d/a-z-]*\s+/i, "").trim();
+    const sp = last.split(/\s+/);
+    if (!street || !suburb || !sp[0] || !sp[1]) return null;
+    return { street, suburb, state: sp[0], postcode: sp[1] };
+  }
+
+  function streetLocality(a) {
+    const e = (s) => (s || "").trim().toLowerCase().replace(/\s+/g, "+");
+    return `${e(a.street)},+${e(a.suburb)},+${e(a.state)}+${(a.postcode || "").trim()}`;
+  }
+
+  async function listingPresentAtMin(listingId, locality, min) {
+    await randomDelay();
+    const url = `https://www.realestate.com.au/buy/between-${min}-any-in-${locality}/list-1`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const t = await res.text();
+    return t.indexOf(String(listingId)) >= 0;
+  }
+
+  async function inferSearchPrice(listingId, address, setStatus) {
+    const parts = parseAddressParts(address);
+    if (!parts) return { ok: false, message: "Can't parse address" };
+    const locality = streetLocality(parts);
+    setStatus("Checking search index…");
+    if (!(await listingPresentAtMin(listingId, locality, 0))) {
+      return { ok: false, message: "Listing not found in street search" };
+    }
+    // Bracket: double the min until the listing drops out.
+    let lo = 0;
+    let hi = 50000;
+    while (await listingPresentAtMin(listingId, locality, hi)) {
+      lo = hi;
+      hi *= 2;
+      setStatus(`Bracketing… ${hi.toLocaleString()}`);
+      if (hi > 50000000) break;
+    }
+    // Binary search the boundary (largest min where the listing still appears).
+    const STEP = 5000;
+    while (hi - lo > STEP) {
+      const mid = Math.round((lo + hi) / 2 / STEP) * STEP;
+      if (mid <= lo || mid >= hi) break;
+      setStatus(`Narrowing… ${mid.toLocaleString()}`);
+      if (await listingPresentAtMin(listingId, locality, mid)) lo = mid;
+      else hi = mid;
+    }
+    return { ok: true, price: Math.round(lo / STEP) * STEP };
+  }
+
+  function attachInfer(container, listingId, address) {
+    if (!container || !listingId || !address) return;
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<button id="rex_infer_btn">Infer search price</button> <span id="rex_infer_result" class="small"></span>`;
+    container.appendChild(wrap);
+    const btn = wrap.querySelector("#rex_infer_btn");
+    const out = wrap.querySelector("#rex_infer_result");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      out.textContent = "Searching…";
+      try {
+        const r = await inferSearchPrice(listingId, address, (s) => {
+          out.textContent = s;
+        });
+        if (r.ok) out.innerHTML = `<strong>${fmtMoney(r.price)}</strong> <span class="small">(search index)</span>`;
+        else out.textContent = r.message || "Not found";
+      } catch (e) {
+        out.textContent = "Error: " + String(e);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  }
+
   // ---- Panel / Styling ----
 
   function ensureStyle() {
@@ -492,6 +587,8 @@
     const views = findByTypename(tree, "Views");
     out.pageViews = views && views.display;
     out.viewsUpdated = views && views.lastUpdated && views.lastUpdated.value;
+
+    out.listingId = getIdFromUrl(location.pathname);
     return out;
   }
 
@@ -502,7 +599,8 @@
       priceBlock = `<div class="big">${escapeHtml(L.searchRange)}</div>
         <div class="small">Display: ${escapeHtml(L.priceDisplay || "N/A")}${range ? ` · mid ${fmtMoney(range.mid)}` : ""}</div>`;
     } else {
-      priceBlock = `<div class="big">${escapeHtml(L.priceDisplay || "N/A")}</div>`;
+      priceBlock = `<div class="big">${escapeHtml(L.priceDisplay || "N/A")}</div>
+        <div id="rex_infer_slot"></div>`;
     }
 
     // Days on market from the hidden publishedDate.
@@ -678,17 +776,24 @@
     const L = extractListing(tree);
     el.innerHTML = panelTemplate(renderListingBody(L));
     bindToggle(el);
+    if (!L.searchRange) attachInfer(el.querySelector("#rex_infer_slot"), L.listingId, L.address);
     loadHistory(el, L.address, parseRange(L.searchRange));
     bindValuation(el, L.address);
     return true;
   }
 
-  async function loadProfileBand(el, listingUrl, timeline) {
+  async function loadProfileBand(el, listingUrl, timeline, address) {
     const band = el.querySelector("#rex_band");
     if (!band) return;
     const data = await fetchListingBand(listingUrl);
     if (!data || !data.searchRange) {
       band.textContent = (data && data.priceDisplay) || "N/A";
+      // No published band — offer to recover the indexed search price.
+      attachInfer(el.querySelector("#rex_infer_slot"), getIdFromUrl(listingUrl), address);
+      if (data && data.pageViews != null) {
+        const viewsEl = el.querySelector("#rex_views");
+        if (viewsEl) viewsEl.innerHTML = `<span class="k">Page views:</span> ${escapeHtml(String(data.pageViews))}${data.viewsUpdated ? ` <span class="small">(as of ${String(data.viewsUpdated).slice(0, 10)})</span>` : ""}`;
+      }
       return;
     }
     const range = parseRange(data.searchRange);
@@ -714,6 +819,7 @@
     const guideSection = P.listingUrl
       ? `<div class="k">Price guide (hidden search band):</div>
          <div id="rex_band" class="big">Loading…</div>
+         <div id="rex_infer_slot"></div>
          <div id="rex_views"></div>`
       : `<div class="k">Price guide:</div><div>No active listing</div>`;
 
@@ -733,7 +839,7 @@
     el.innerHTML = panelTemplate(body);
     bindToggle(el);
     bindValuation(el, P.address);
-    if (P.listingUrl) loadProfileBand(el, P.listingUrl, P.timeline);
+    if (P.listingUrl) loadProfileBand(el, P.listingUrl, P.timeline, P.address);
     return true;
   }
 
