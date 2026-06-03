@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.3.2
+// @version      0.3.3
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -146,11 +146,14 @@
   function extractBand(tree) {
     const price = findByTypename(tree, "BuyPrice");
     const published = findByKey(tree, "publishedDate");
+    const views = findByTypename(tree, "Views");
     return {
       searchRange: price && price.searchRange,
       priceDisplay: price && price.display,
       productDepth: findByKey(tree, "productDepth"),
       publishedRaw: typeof published === "string" ? published.replace(/^Date Published:\s*/i, "").trim() : null,
+      pageViews: views && views.display,
+      viewsUpdated: views && views.lastUpdated && views.lastUpdated.value,
     };
   }
 
@@ -690,6 +693,10 @@
     }
     const range = parseRange(data.searchRange);
     band.textContent = data.searchRange;
+    const viewsEl = el.querySelector("#rex_views");
+    if (viewsEl && data.pageViews != null) {
+      viewsEl.innerHTML = `<span class="k">Page views:</span> ${escapeHtml(String(data.pageViews))}${data.viewsUpdated ? ` <span class="small">(as of ${String(data.viewsUpdated).slice(0, 10)})</span>` : ""}`;
+    }
     // Now that we have a guide mid, re-render the timeline with growth-vs-guide.
     const histEl = el.querySelector("#rex_profile_hist");
     if (histEl && range) histEl.innerHTML = renderTimeline(timeline, range);
@@ -706,7 +713,8 @@
 
     const guideSection = P.listingUrl
       ? `<div class="k">Price guide (hidden search band):</div>
-         <div id="rex_band" class="big">Loading…</div>`
+         <div id="rex_band" class="big">Loading…</div>
+         <div id="rex_views"></div>`
       : `<div class="k">Price guide:</div><div>No active listing</div>`;
 
     const body = `
