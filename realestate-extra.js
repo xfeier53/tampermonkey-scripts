@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.1.0
+// @version      0.3.0
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -116,14 +116,12 @@
     return null;
   }
 
-  // Parse the listing-page GraphQL component tree.
-  function getListingTree() {
-    const mod = getArgonautModule(LISTING_MODULE);
+  // Turn a listing module (live or fetched) into its GraphQL component tree.
+  function treeFromListingModule(mod) {
     if (!mod || !mod.urqlClientCache) return null;
     try {
       const cache = JSON.parse(mod.urqlClientCache);
-      const keys = Object.keys(cache);
-      for (const k of keys) {
+      for (const k of Object.keys(cache)) {
         const entry = cache[k];
         if (entry && typeof entry.data === "string") {
           try {
@@ -137,6 +135,23 @@
       /* ignore */
     }
     return null;
+  }
+
+  // Parse the listing-page GraphQL component tree from the live document.
+  function getListingTree() {
+    return treeFromListingModule(getArgonautModule(LISTING_MODULE));
+  }
+
+  // Pull just the hidden price-band fields from a listing tree (live or fetched).
+  function extractBand(tree) {
+    const price = findByTypename(tree, "BuyPrice");
+    const published = findByKey(tree, "publishedDate");
+    return {
+      searchRange: price && price.searchRange,
+      priceDisplay: price && price.display,
+      productDepth: findByKey(tree, "productDepth"),
+      publishedRaw: typeof published === "string" ? published.replace(/^Date Published:\s*/i, "").trim() : null,
+    };
   }
 
   // Parse the property-profile data object.
@@ -163,6 +178,25 @@
         if (hit) return hit;
       }
       return null;
+    }
+    return walk(root);
+  }
+
+  // Generic: find first primitive value for a given key anywhere in the tree.
+  function findByKey(root, key) {
+    const seen = new Set();
+    function walk(x) {
+      if (!x || typeof x !== "object" || seen.has(x)) return undefined;
+      seen.add(x);
+      for (const k of Object.keys(x)) {
+        const v = x[k];
+        if (k === key && v !== null && typeof v !== "object") return v;
+        if (v && typeof v === "object") {
+          const hit = walk(v);
+          if (hit !== undefined) return hit;
+        }
+      }
+      return undefined;
     }
     return walk(root);
   }
@@ -336,6 +370,20 @@
     return { ok: true, profile: pp };
   }
 
+  // Profile pages don't embed the price band; fetch it from the linked listing.
+  async function fetchListingBand(listingUrl) {
+    try {
+      const res = await fetch(listingUrl, { credentials: "include" });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const tree = treeFromListingModule(parseArgonautFromHtml(html, LISTING_MODULE));
+      if (!tree) return null;
+      return extractBand(tree);
+    } catch (e) {
+      return null;
+    }
+  }
+
   function getTimeline(profile) {
     const tl = profile && profile.property && profile.property.propertyTimeline;
     if (!Array.isArray(tl)) return [];
@@ -432,26 +480,15 @@
     out.state = addr && addr.state;
     out.postcode = addr && addr.postcode;
 
-    const price = findByTypename(tree, "BuyPrice");
-    out.priceDisplay = price && price.display;
-    out.searchRange = price && price.searchRange;
+    const band = extractBand(tree);
+    out.priceDisplay = band.priceDisplay;
+    out.searchRange = band.searchRange;
+    out.productDepth = band.productDepth;
+    out.publishedRaw = band.publishedRaw;
 
     const views = findByTypename(tree, "Views");
     out.pageViews = views && views.display;
     out.viewsUpdated = views && views.lastUpdated && views.lastUpdated.value;
-
-    const gf = findByTypename(tree, "GeneralFeatures");
-    if (gf) {
-      out.beds = gf.bedrooms && gf.bedrooms.value;
-      out.baths = gf.bathrooms && gf.bathrooms.value;
-      out.cars = gf.parkingSpaces && gf.parkingSpaces.value;
-    }
-
-    const sizes = findByTypename(tree, "PropertySizes");
-    if (sizes) {
-      const land = sizes.land || sizes.preferred;
-      if (land && land.displayValue) out.land = `${land.displayValue} ${land.sizeUnit ? land.sizeUnit.displayValue : ""}`.trim();
-    }
     return out;
   }
 
@@ -465,27 +502,31 @@
       priceBlock = `<div class="big">${escapeHtml(L.priceDisplay || "N/A")}</div>`;
     }
 
-    const specs = [L.beds != null ? `${L.beds} bed` : null, L.baths != null ? `${L.baths} bath` : null, L.cars != null ? `${L.cars} car` : null, L.land || null]
-      .filter(Boolean)
-      .join(" · ");
+    // Days on market from the hidden publishedDate.
+    let listedLine = "N/A";
+    if (L.publishedRaw) {
+      const dom = daysFrom(L.publishedRaw);
+      listedLine = `${escapeHtml(L.publishedRaw)}${dom != null ? ` <span class="small">(${dom} days on market)</span>` : ""}`;
+    }
 
     const viewsLine =
       L.pageViews != null
-        ? `${escapeHtml(String(L.pageViews))} views${L.viewsUpdated ? ` <span class="small">(as of ${String(L.viewsUpdated).slice(0, 10)})</span>` : ""}`
+        ? `${escapeHtml(String(L.pageViews))}${L.viewsUpdated ? ` <span class="small">(as of ${String(L.viewsUpdated).slice(0, 10)})</span>` : ""}`
         : "N/A";
+
+    const tierLine = L.productDepth ? `<div><span class="k">Ad tier:</span> ${escapeHtml(String(L.productDepth))}</div>` : "";
 
     return `
       <div class="k">Price guide (hidden search band):</div>
       ${priceBlock}
       <div class="sec">
-        <div><span class="k">Specs:</span> ${escapeHtml(specs || "N/A")}</div>
+        <div><span class="k">Listed:</span> ${listedLine}</div>
         <div><span class="k">Page views:</span> ${viewsLine}</div>
-        <div><span class="k">Address:</span> ${escapeHtml(L.address || "N/A")}</div>
+        ${tierLine}
       </div>
       <div class="sec">
         <div class="k">Sold history &amp; growth:</div>
-        <div id="rex_hist_result" class="mono">Not run</div>
-        <button id="rex_hist_btn">Fetch history</button>
+        <div id="rex_hist_result" class="mono">Loading…</div>
         <div id="rex_hist_status" class="small"></div>
       </div>
       <div class="sec">
@@ -512,6 +553,13 @@
     out.floor = a.floorArea && a.floorArea.display;
     out.propertyType = a.propertyType;
     out.timeline = getTimeline(pp);
+
+    // Profile pages don't embed the price band, but if there's an active listing
+    // we can follow it. Prefer the explicit "View listing" link.
+    const links = [...document.querySelectorAll('a[href*="/property-"]')];
+    const viewListing = links.find((x) => /view listing/i.test(x.textContent || ""));
+    const cand = viewListing || links.find((x) => /\/property-.+-\d+\/?(?:$|\?)/.test(x.getAttribute("href") || ""));
+    out.listingUrl = cand ? cand.href : null;
     return out;
   }
 
@@ -543,35 +591,27 @@
 
   // ---- Bindings ----
 
-  function bindHistory(el, address, currentGuide) {
-    const btn = el.querySelector("#rex_hist_btn");
+  async function loadHistory(el, address, currentGuide) {
     const status = el.querySelector("#rex_hist_status");
     const result = el.querySelector("#rex_hist_result");
-    if (!btn || !status || !result) return;
-    btn.onclick = async () => {
-      btn.disabled = true;
-      result.textContent = "Fetching…";
-      status.textContent = "";
-      const setStatus = (s) => {
-        status.textContent = s;
-      };
-      try {
-        const out = await fetchTimelineByLookup(address, setStatus);
-        if (!out.ok) {
-          result.textContent = "N/A";
-          status.innerHTML = out.message;
-        } else {
-          const timeline = getTimeline(out.profile);
-          result.innerHTML = renderTimeline(timeline, currentGuide);
-          status.textContent = "";
-        }
-      } catch (e) {
-        result.textContent = "N/A";
-        status.textContent = "Error: " + String(e);
-      } finally {
-        btn.disabled = false;
-      }
+    if (!status || !result) return;
+    const setStatus = (s) => {
+      status.textContent = s;
     };
+    try {
+      const out = await fetchTimelineByLookup(address, setStatus);
+      if (!out.ok) {
+        result.textContent = "N/A";
+        status.innerHTML = out.message;
+      } else {
+        const timeline = getTimeline(out.profile);
+        result.innerHTML = renderTimeline(timeline, currentGuide);
+        status.textContent = "";
+      }
+    } catch (e) {
+      result.textContent = "N/A";
+      status.textContent = "Error: " + String(e);
+    }
   }
 
   function bindValuation(el, address) {
@@ -635,9 +675,35 @@
     const L = extractListing(tree);
     el.innerHTML = panelTemplate(renderListingBody(L));
     bindToggle(el);
-    bindHistory(el, L.address, parseRange(L.searchRange));
+    loadHistory(el, L.address, parseRange(L.searchRange));
     bindValuation(el, L.address);
     return true;
+  }
+
+  async function loadProfileBand(el, listingUrl, timeline) {
+    const band = el.querySelector("#rex_band");
+    const sub = el.querySelector("#rex_band_sub");
+    if (!band) return;
+    const data = await fetchListingBand(listingUrl);
+    if (!data || !data.searchRange) {
+      band.textContent = (data && data.priceDisplay) || "N/A";
+      if (sub) sub.textContent = "";
+      return;
+    }
+    const range = parseRange(data.searchRange);
+    band.textContent = data.searchRange;
+    const bits = [];
+    if (data.priceDisplay) bits.push(`Display: ${data.priceDisplay}`);
+    if (range) bits.push(`mid ${fmtMoney(range.mid)}`);
+    if (data.publishedRaw) {
+      const dom = daysFrom(data.publishedRaw);
+      bits.push(`listed ${data.publishedRaw}${dom != null ? ` (${dom}d)` : ""}`);
+    }
+    if (data.productDepth) bits.push(`tier ${data.productDepth}`);
+    if (sub) sub.textContent = bits.join(" · ");
+    // Now that we have a guide mid, re-render the timeline with growth-vs-guide.
+    const histEl = el.querySelector("#rex_profile_hist");
+    if (histEl && range) histEl.innerHTML = renderTimeline(timeline, range);
   }
 
   function renderProfile(el) {
@@ -648,17 +714,22 @@
       return false;
     }
     const P = extractProfile(pp);
-    const specs = [P.beds != null ? `${P.beds} bed` : null, P.baths != null ? `${P.baths} bath` : null, P.cars != null ? `${P.cars} car` : null, P.land || null, P.floor && P.floor !== "-" ? `floor ${P.floor}` : null]
-      .filter(Boolean)
-      .join(" · ");
+
+    const guideSection = P.listingUrl
+      ? `<div class="k">Price guide (hidden search band):</div>
+         <div id="rex_band" class="big">Loading…</div>
+         <div id="rex_band_sub" class="small"></div>`
+      : `<div class="k">Price guide:</div><div>No active listing</div>`;
 
     const body = `
-      <div><span class="k">Status:</span> ${escapeHtml(String(P.marketStatus || "N/A"))}</div>
-      <div><span class="k">Specs:</span> ${escapeHtml(specs || "N/A")}</div>
-      <div><span class="k">Address:</span> ${escapeHtml(P.address || "N/A")}</div>
+      ${guideSection}
+      <div class="sec">
+        <div><span class="k">Status:</span> ${escapeHtml(String(P.marketStatus || "N/A"))}</div>
+        <div><span class="k">Address:</span> ${escapeHtml(P.address || "N/A")}</div>
+      </div>
       <div class="sec">
         <div class="k">Sold history &amp; growth:</div>
-        <div class="mono">${renderTimeline(P.timeline, null)}</div>
+        <div id="rex_profile_hist" class="mono">${renderTimeline(P.timeline, null)}</div>
       </div>
       <div class="sec">
         <div class="k">PropTrack estimate (property.com.au): <span id="rex_val_link"></span></div>
@@ -670,6 +741,7 @@
     el.innerHTML = panelTemplate(body);
     bindToggle(el);
     bindValuation(el, P.address);
+    if (P.listingUrl) loadProfileBand(el, P.listingUrl, P.timeline);
     return true;
   }
 
