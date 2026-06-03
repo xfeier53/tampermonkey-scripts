@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.3.0
+// @version      0.3.2
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -682,25 +682,14 @@
 
   async function loadProfileBand(el, listingUrl, timeline) {
     const band = el.querySelector("#rex_band");
-    const sub = el.querySelector("#rex_band_sub");
     if (!band) return;
     const data = await fetchListingBand(listingUrl);
     if (!data || !data.searchRange) {
       band.textContent = (data && data.priceDisplay) || "N/A";
-      if (sub) sub.textContent = "";
       return;
     }
     const range = parseRange(data.searchRange);
     band.textContent = data.searchRange;
-    const bits = [];
-    if (data.priceDisplay) bits.push(`Display: ${data.priceDisplay}`);
-    if (range) bits.push(`mid ${fmtMoney(range.mid)}`);
-    if (data.publishedRaw) {
-      const dom = daysFrom(data.publishedRaw);
-      bits.push(`listed ${data.publishedRaw}${dom != null ? ` (${dom}d)` : ""}`);
-    }
-    if (data.productDepth) bits.push(`tier ${data.productDepth}`);
-    if (sub) sub.textContent = bits.join(" · ");
     // Now that we have a guide mid, re-render the timeline with growth-vs-guide.
     const histEl = el.querySelector("#rex_profile_hist");
     if (histEl && range) histEl.innerHTML = renderTimeline(timeline, range);
@@ -717,16 +706,11 @@
 
     const guideSection = P.listingUrl
       ? `<div class="k">Price guide (hidden search band):</div>
-         <div id="rex_band" class="big">Loading…</div>
-         <div id="rex_band_sub" class="small"></div>`
+         <div id="rex_band" class="big">Loading…</div>`
       : `<div class="k">Price guide:</div><div>No active listing</div>`;
 
     const body = `
       ${guideSection}
-      <div class="sec">
-        <div><span class="k">Status:</span> ${escapeHtml(String(P.marketStatus || "N/A"))}</div>
-        <div><span class="k">Address:</span> ${escapeHtml(P.address || "N/A")}</div>
-      </div>
       <div class="sec">
         <div class="k">Sold history &amp; growth:</div>
         <div id="rex_profile_hist" class="mono">${renderTimeline(P.timeline, null)}</div>
