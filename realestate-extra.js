@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.5.0
+// @version      0.6.0
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -144,7 +144,7 @@
 
   // Pull just the hidden price-band fields from a listing tree (live or fetched).
   function extractBand(tree) {
-    const price = findByTypename(tree, "BuyPrice");
+    const price = findByTypename(tree, "BuyPrice") || findByTypename(tree, "SoldPrice");
     const published = findByKey(tree, "publishedDate");
     const views = findByTypename(tree, "Views");
     return {
@@ -432,29 +432,30 @@
     return `${e(a.street)},+${e(a.suburb)},+${e(a.state)}+${(a.postcode || "").trim()}`;
   }
 
-  async function listingPresentAtMin(listingId, locality, min) {
+  async function listingPresentAtMin(listingId, locality, min, seg) {
     await randomDelay();
-    const url = `https://www.realestate.com.au/buy/between-${min}-any-in-${locality}/list-1`;
+    const url = `https://www.realestate.com.au/${seg}/between-${min}-any-in-${locality}/list-1`;
     const res = await fetch(url, { credentials: "include" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const t = await res.text();
     return t.indexOf(String(listingId)) >= 0;
   }
 
-  async function inferSearchPrice(listingId, address, setStatus) {
+  async function inferSearchPrice(listingId, address, setStatus, mode) {
+    const seg = mode === "sold" ? "sold" : "buy";
     const RANGE_HIGH = 5000000; // search 0 – $5m
     const STEP = 5000;
     const parts = parseAddressParts(address);
     if (!parts) return { ok: false, message: "Can't parse address" };
     const locality = streetLocality(parts);
     setStatus("Checking search index…");
-    if (!(await listingPresentAtMin(listingId, locality, 0))) {
+    if (!(await listingPresentAtMin(listingId, locality, 0, seg))) {
       return { ok: false, message: "Listing not found in street search" };
     }
     let lo = 0;
     let hi = RANGE_HIGH;
     // Still present at the top of the range => price is at or above RANGE_HIGH.
-    if (await listingPresentAtMin(listingId, locality, hi)) {
+    if (await listingPresentAtMin(listingId, locality, hi, seg)) {
       return { ok: true, price: RANGE_HIGH, atOrAbove: true };
     }
     // Binary search the boundary (largest min where the listing still appears).
@@ -462,13 +463,13 @@
       const mid = Math.round((lo + hi) / 2 / STEP) * STEP;
       if (mid <= lo || mid >= hi) break;
       setStatus(`Narrowing… ${mid.toLocaleString()}`);
-      if (await listingPresentAtMin(listingId, locality, mid)) lo = mid;
+      if (await listingPresentAtMin(listingId, locality, mid, seg)) lo = mid;
       else hi = mid;
     }
     return { ok: true, price: Math.round(lo / STEP) * STEP };
   }
 
-  function bindInfer(el, listingId, address) {
+  function bindInfer(el, listingId, address, mode) {
     const btn = el.querySelector("#rex_infer_btn");
     const status = el.querySelector("#rex_infer_status");
     const result = el.querySelector("#rex_infer_result");
@@ -483,9 +484,14 @@
       result.textContent = "Running…";
       status.textContent = "";
       try {
-        const r = await inferSearchPrice(listingId, address, (s) => {
-          status.textContent = s;
-        });
+        const r = await inferSearchPrice(
+          listingId,
+          address,
+          (s) => {
+            status.textContent = s;
+          },
+          mode
+        );
         if (r.ok) {
           // Solved: show the price big + bold and keep the button disabled.
           result.innerHTML = `<span style="font-size:18px;font-weight:700">${fmtMoney(r.price)}${r.atOrAbove ? "+" : ""}</span>`;
@@ -572,6 +578,7 @@
 
   function detectPage() {
     const p = location.pathname;
+    if (/^\/sold\/property-.+-\d+\/?$/.test(p)) return "sold";
     if (/^\/property-.+-\d+\/?$/.test(p)) return "listing";
     if (/^\/property\/.+/.test(p)) return "profile";
     return null;
@@ -600,20 +607,30 @@
     out.pageViews = views && views.display;
     out.viewsUpdated = views && views.lastUpdated && views.lastUpdated.value;
 
+    const dateSold = findByTypename(tree, "DateSold");
+    out.soldDate = dateSold && dateSold.display;
+
     out.listingId = getIdFromUrl(location.pathname);
     return out;
   }
 
-  function renderListingBody(L) {
+  function renderListingBody(L, isSold) {
     const range = parseRange(L.searchRange);
     const priceLine = L.searchRange
       ? `${escapeHtml(L.searchRange)}${range ? ` <span class="small">(mid ${fmtMoney(range.mid)})</span>` : ""}`
       : escapeHtml(L.priceDisplay || "N/A");
 
-    let listedLine = "N/A";
-    if (L.publishedRaw) {
-      const dom = daysFrom(L.publishedRaw);
-      listedLine = `${escapeHtml(L.publishedRaw)}${dom != null ? ` (${dom} days)` : ""}`;
+    let dateLine;
+    if (isSold) {
+      const dom = L.soldDate ? daysFrom(L.soldDate) : null;
+      dateLine = `<div><span class="k">Date Sold:</span> ${L.soldDate ? `${escapeHtml(L.soldDate)}${dom != null ? ` (${dom} days ago)` : ""}` : "N/A"}</div>`;
+    } else {
+      let listedLine = "N/A";
+      if (L.publishedRaw) {
+        const dom = daysFrom(L.publishedRaw);
+        listedLine = `${escapeHtml(L.publishedRaw)}${dom != null ? ` (${dom} days)` : ""}`;
+      }
+      dateLine = `<div><span class="k">Listed:</span> ${listedLine}</div>`;
     }
 
     const viewsLine =
@@ -622,21 +639,23 @@
         : "N/A";
 
     const tierLine = L.productDepth ? `<div><span class="k">Ad Tier:</span> ${escapeHtml(String(L.productDepth))}</div>` : "";
+    const priceLabel = isSold ? "Sold Price" : "Price";
+    const inferLabel = isSold ? "Sold Price (inferred)" : "Search Price (inferred)";
 
     return `
-      <div><span class="k">Listed:</span> ${listedLine}</div>
+      ${dateLine}
       <div><span class="k">Page Views:</span> ${viewsLine}</div>
       ${tierLine}
-      <div><span class="k">Price:</span> ${priceLine}</div>
+      <div><span class="k">${priceLabel}:</span> ${priceLine}</div>
       <div class="sec">
         <div class="k">Price History:</div>
         <div id="rex_hist_result" class="mono">Loading…</div>
         <div id="rex_hist_status" class="small"></div>
       </div>
       <div class="sec">
-        <div class="k">Search Price (inferred):</div>
+        <div class="k">${inferLabel}:</div>
         <div id="rex_infer_result" class="mono">Not run</div>
-        <button id="rex_infer_btn">Infer search price</button>
+        <button id="rex_infer_btn">Infer ${isSold ? "sold" : "search"} price</button>
         <div id="rex_infer_status" class="small"></div>
       </div>
       <div class="sec">
@@ -775,7 +794,7 @@
 
   // ---- Render orchestration ----
 
-  function renderListing(el) {
+  function renderListing(el, isSold) {
     const tree = getListingTree();
     if (!tree) {
       el.innerHTML = panelTemplate(`<div class="k">Waiting for data…</div>`);
@@ -783,10 +802,10 @@
       return false;
     }
     const L = extractListing(tree);
-    el.innerHTML = panelTemplate(renderListingBody(L));
+    el.innerHTML = panelTemplate(renderListingBody(L, isSold));
     bindToggle(el);
     loadHistory(el, L.address, parseRange(L.searchRange));
-    bindInfer(el, L.listingId, L.address);
+    bindInfer(el, L.listingId, L.address, isSold ? "sold" : "buy");
     bindValuation(el, L.address);
     return true;
   }
@@ -868,7 +887,7 @@
     // Avoid re-rendering the same page once buttons are bound.
     if (key === lastKey && el.querySelector("#rex_val_btn")) return;
 
-    const ok = page === "listing" ? renderListing(el) : renderProfile(el);
+    const ok = page === "profile" ? renderProfile(el) : renderListing(el, page === "sold");
     if (ok) lastKey = key;
   }
 
