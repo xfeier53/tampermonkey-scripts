@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.7
+// @version      0.14.8
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -847,9 +847,19 @@
   const RANGE_HIGH = 5000000;
   const STEP = 10000;
 
+  function findListingIndexInHtml(html, targetId) {
+    const tid = String(targetId);
+    const markers = [`"id":${tid}`, `"id":"${tid}"`, `details-${tid}`];
+    const indexes = markers.map((marker) => html.indexOf(marker)).filter((idx) => idx >= 0);
+    return indexes.length ? Math.min(...indexes) : -1;
+  }
+
+  function inHtmlResults(html, targetId) {
+    return findListingIndexInHtml(html, targetId) >= 0;
+  }
+
   function findBandInHtml(html, targetId) {
-    const marker = `"id":${targetId}`;
-    const idx = html.indexOf(marker);
+    const idx = findListingIndexInHtml(html, targetId);
     if (idx < 0) return null;
     const seg = html.slice(idx, idx + 2500);
     const m = seg.match(/"priceRange"\s*:\s*\{\s*"gte"\s*:\s*(\d+)\s*,\s*"lte"\s*:\s*(\d+)\s*\}/);
@@ -945,7 +955,60 @@
     return { gte: Math.min(lower, upper), lte: Math.max(lower, upper), atOrAbove: upper >= RANGE_HIGH };
   }
 
-  async function fetchSearchBand({ targetId, divisionSlug, streetSlug, setStatus }) {
+  function getSearchSegment(listingStatus) {
+    return String(listingStatus || "").toUpperCase() === "SOLD" ? "sold" : "sale";
+  }
+
+  function buildPriceFilteredSuburbUrl({ divisionSlug, segment, min, max }) {
+    const url = new URL(`/${segment}/${divisionSlug}/`, location.origin);
+    url.searchParams.set("price", `${Math.max(0, min)}-${Math.max(0, max)}`);
+    return url.href;
+  }
+
+  async function probeSearchHtml({ min, max, divisionSlug, segment }, retryCount = 0) {
+    await randomDelay();
+    const url = buildPriceFilteredSuburbUrl({ divisionSlug, segment, min, max });
+    const res = await fetch(url, { credentials: "include" });
+    if ((res.status === 429 || res.status === 503) && retryCount < 1) {
+      await randomDelay(1000, 2000);
+      return probeSearchHtml({ min, max, divisionSlug, segment }, retryCount + 1);
+    }
+    if (!res.ok) throw new Error(`HTML ${res.status}`);
+    return res.text();
+  }
+
+  async function inferBandViaHtmlFilters({ targetId, divisionSlug, listingStatus, setStatus }) {
+    if (!divisionSlug) return null;
+    const segment = getSearchSegment(listingStatus);
+    const wide = await probeSearchHtml({ min: RANGE_LOW, max: RANGE_HIGH, divisionSlug, segment });
+    if (!inHtmlResults(wide, targetId)) return null;
+
+    let lo = snapFloor(RANGE_LOW);
+    let hi = snapFloor(RANGE_HIGH) + STEP;
+    while (lo + STEP < hi) {
+      const mid = snapFloor((lo + hi) / 2);
+      setStatus(`Probing page ≥ ${mid.toLocaleString()}…`);
+      const html = await probeSearchHtml({ min: mid, max: RANGE_HIGH, divisionSlug, segment });
+      if (inHtmlResults(html, targetId)) lo = mid;
+      else hi = mid;
+    }
+    const upper = lo;
+
+    let lo2 = snapFloor(RANGE_LOW) - STEP;
+    let hi2 = upper;
+    while (lo2 + STEP < hi2) {
+      const mid = snapFloor((lo2 + hi2) / 2);
+      setStatus(`Probing page ≤ ${mid.toLocaleString()}…`);
+      const html = await probeSearchHtml({ min: RANGE_LOW, max: mid, divisionSlug, segment });
+      if (inHtmlResults(html, targetId)) hi2 = mid;
+      else lo2 = mid;
+    }
+    const lower = hi2;
+
+    return { gte: Math.min(lower, upper), lte: Math.max(lower, upper), atOrAbove: upper >= RANGE_HIGH };
+  }
+
+  async function fetchSearchBand({ targetId, divisionSlug, streetSlug, listingStatus, setStatus }) {
     // 1. Fast path: read the indexed band straight from the suburb results page.
     setStatus("Reading suburb search index…");
     const fromPage = await readSuburbBand({ targetId, divisionSlug });
@@ -968,7 +1031,20 @@
         lastErr = e;
       }
     }
-    if (lastErr) throw lastErr;
+
+    // 3. Current sold-result pages still support URL price filters even when the
+    // JSON search endpoint rejects the old probe shape.
+    setStatus("Probing search result pages…");
+    let htmlErr = null;
+    try {
+      const band = await inferBandViaHtmlFilters({ targetId, divisionSlug, listingStatus, setStatus });
+      if (band) return { ok: true, source: "html-filter", ...band };
+    } catch (e) {
+      htmlErr = e;
+    }
+
+    if (htmlErr) throw htmlErr;
+    if (!divisionSlug && lastErr) throw lastErr;
     return { ok: false, message: "Listing not found in search index" };
   }
 
@@ -1140,7 +1216,7 @@
     });
   }
 
-  function bindBoundary(el, { targetId, divisionSlug, streetSlug, history }) {
+  function bindBoundary(el, { targetId, divisionSlug, streetSlug, listingStatus, history }) {
     const btn = el.querySelector("#ahx_fp_btn");
     const status = el.querySelector("#ahx_fp_status");
     const result = el.querySelector("#ahx_fp_result");
@@ -1154,7 +1230,7 @@
       const setStatus = makeStatusSetter(el, status, myRunId);
 
       try {
-        const out = await fetchSearchBand({ targetId, divisionSlug, streetSlug, setStatus });
+        const out = await fetchSearchBand({ targetId, divisionSlug, streetSlug, listingStatus, setStatus });
 
         if (!isCurrentRun(el, myRunId)) return;
 
@@ -1254,11 +1330,12 @@
 
     const divisionSlug = getDivisionSlug(app);
     const streetSlug = getStreetSlug(app);
+    const listingStatus = listing.status;
     const history = app?.body?.property?.history || [];
 
     el.innerHTML = panelTemplate(renderListingBody(app));
     bindToggle(el);
-    bindBoundary(el, { targetId, divisionSlug, streetSlug, history });
+    bindBoundary(el, { targetId, divisionSlug, streetSlug, listingStatus, history });
     bindPropertyComAu(el, app);
   }
 
