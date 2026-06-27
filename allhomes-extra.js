@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.8
+// @version      0.14.9
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -1222,22 +1222,26 @@
     const result = el.querySelector("#ahx_fp_result");
     if (!btn || !status || !result) return;
 
+    let runId = 0;
     btn.onclick = async () => {
-      const myRunId = ++currentRunId;
+      const myRunId = ++runId;
+      let keepDisabled = false;
+      const isLive = () => myRunId === runId && el.isConnected && btn.isConnected;
       btn.disabled = true;
       result.textContent = "Looking up…";
       status.textContent = "";
-      const setStatus = makeStatusSetter(el, status, myRunId);
+      const setStatus = (message) => {
+        if (isLive()) status.textContent = message;
+      };
 
       try {
         const out = await fetchSearchBand({ targetId, divisionSlug, streetSlug, listingStatus, setStatus });
 
-        if (!isCurrentRun(el, myRunId)) return;
+        if (!isLive()) return;
 
         if (!out.ok) {
           result.textContent = "N/A";
           status.textContent = out.message;
-          btn.disabled = false;
           return;
         }
 
@@ -1250,12 +1254,14 @@
         });
         const srcLabel = out.source === "filter" ? "filter probe" : `${out.source} page`;
         status.textContent = `${srcLabel}${out.label ? ` · label "${out.label}"` : ""}`;
+        keepDisabled = true;
         // Band is fixed for the listing — keep the button disabled once resolved.
       } catch (e) {
-        if (!isCurrentRun(el, myRunId)) return;
+        if (!isLive()) return;
         result.textContent = "N/A";
         status.textContent = `Error: ${String(e)}`;
-        btn.disabled = false;
+      } finally {
+        if (isLive() && !keepDisabled) btn.disabled = false;
       }
     };
   }
