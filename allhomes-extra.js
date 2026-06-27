@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.2
+// @version      0.14.3
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -46,6 +46,19 @@
 
   function removeSuburbPanel() {
     removeElementById(SUBURB_PANEL_ID);
+  }
+
+  function bindPanelToggle(el, { headerSelector, bodySelector, toggleSelector }) {
+    const header = el.querySelector(headerSelector);
+    const body = el.querySelector(bodySelector);
+    const toggle = el.querySelector(toggleSelector);
+    if (!header || !body || !toggle) return;
+
+    header.onclick = () => {
+      const hidden = body.style.display === "none";
+      body.style.display = hidden ? "" : "none";
+      toggle.textContent = hidden ? "–" : "+";
+    };
   }
 
   // ---- Utilities ----
@@ -303,7 +316,7 @@
       style.id = SUBURB_STYLE_ID;
       style.textContent = `
         #${SUBURB_PANEL_ID}{
-          position:fixed;top:10px;right:10px;z-index:2147483647;
+          position:fixed;top:10px;left:10px;z-index:2147483647;
           background:rgba(255,255,255,.97);
           border:1px solid rgba(0,0,0,.2);border-radius:10px;
           font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI";
@@ -311,7 +324,7 @@
         }
         #${SUBURB_PANEL_ID} .ahx-header{
           display:flex;align-items:center;justify-content:space-between;
-          padding:8px 10px;border-bottom:1px solid rgba(0,0,0,.08);font-weight:600;cursor:default;
+          padding:8px 10px;border-bottom:1px solid rgba(0,0,0,.08);font-weight:600;cursor:pointer;user-select:none;
         }
         #${SUBURB_PANEL_ID} .ahx-toggle{cursor:pointer;user-select:none;font-size:14px;line-height:1;padding:0 4px;}
         #${SUBURB_PANEL_ID} .ahx-body{padding:8px 10px;max-height:70vh;overflow:auto;}
@@ -344,12 +357,10 @@
           <div class="ahx-body" id="ahx_sb_body"></div>
         `;
         document.documentElement.appendChild(el);
-        el.querySelector("#ahx_sb_toggle").addEventListener("click", () => {
-          const body = el.querySelector("#ahx_sb_body");
-          const t = el.querySelector("#ahx_sb_toggle");
-          const hidden = body.style.display === "none";
-          body.style.display = hidden ? "" : "none";
-          t.textContent = hidden ? "–" : "+";
+        bindPanelToggle(el, {
+          headerSelector: ".ahx-header",
+          bodySelector: "#ahx_sb_body",
+          toggleSelector: "#ahx_sb_toggle",
         });
       }
       return el;
@@ -611,7 +622,7 @@
       }
       #${PANEL_ID} .ahx-header{
         display:flex;align-items:center;justify-content:space-between;
-        padding:8px 10px;border-bottom:1px solid rgba(0,0,0,.08);font-weight:600;
+        padding:8px 10px;border-bottom:1px solid rgba(0,0,0,.08);font-weight:600;cursor:pointer;user-select:none;
       }
       #${PANEL_ID} .ahx-toggle{cursor:pointer;user-select:none;font-size:14px;line-height:1;}
       #${PANEL_ID} .ahx-body{padding:10px 12px;}
@@ -631,29 +642,59 @@
     return document.fullscreenElement || document.webkitFullscreenElement || null;
   }
 
-  // When the photo gallery enters native fullscreen, the browser paints only the
-  // fullscreen element's subtree (the "top layer"); a panel attached elsewhere in
-  // the DOM becomes invisible and unclickable. Keep the panel inside whatever
-  // element is fullscreen, and move it back to <html> once fullscreen exits.
+  function currentGalleryLayer() {
+    const dialog = document.querySelector(
+      '#react-aria-modal-dialog[aria-label="Photo Gallery"], [role="dialog"][aria-label="Photo Gallery"]'
+    );
+    if (!dialog) return null;
+
+    const layers = [...document.querySelectorAll("body *")]
+      .filter((node) => {
+        const style = getComputedStyle(node);
+        if (style.position !== "fixed") return false;
+        const zIndex = Number.parseInt(style.zIndex, 10);
+        if (!Number.isFinite(zIndex)) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width >= innerWidth * 0.8 && rect.height >= innerHeight * 0.8;
+      })
+      .sort(
+        (a, b) =>
+          Number.parseInt(getComputedStyle(b).zIndex, 10) -
+          Number.parseInt(getComputedStyle(a).zIndex, 10)
+      );
+
+    return layers[0] || dialog;
+  }
+
+  function currentPanelHost() {
+    return currentFullscreenElement() || currentGalleryLayer();
+  }
+
+  // Keep the panel inside the active top layer. Allhomes uses native fullscreen
+  // in some contexts and a React Aria photo-gallery dialog in others.
   function placeInTopLayer(el) {
-    const fsEl = currentFullscreenElement();
-    if (fsEl && fsEl !== el) {
-      if (!fsEl.contains(el)) fsEl.appendChild(el);
+    const host = currentPanelHost();
+    if (host && host !== el) {
+      if (!host.contains(el)) host.appendChild(el);
     } else if (el.parentNode !== document.documentElement) {
       document.documentElement.appendChild(el);
     }
   }
 
-  let fullscreenHooked = false;
-  function hookFullscreen() {
-    if (fullscreenHooked) return;
-    fullscreenHooked = true;
+  let panelPlacementHooked = false;
+  function hookPanelPlacement() {
+    if (panelPlacementHooked) return;
+    panelPlacementHooked = true;
     const reseat = () => {
       const el = document.getElementById(PANEL_ID);
       if (el) placeInTopLayer(el);
     };
     document.addEventListener("fullscreenchange", reseat, true);
     document.addEventListener("webkitfullscreenchange", reseat, true);
+    new MutationObserver(reseat).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
   }
 
   function ensurePanel() {
@@ -1049,14 +1090,11 @@
   }
 
   function bindToggle(el) {
-    const toggle = el.querySelector("#ahx_toggle");
-    const body = el.querySelector("#ahx_body");
-    if (!toggle || !body) return;
-    toggle.onclick = () => {
-      const hidden = body.style.display === "none";
-      body.style.display = hidden ? "" : "none";
-      toggle.textContent = hidden ? "–" : "+";
-    };
+    bindPanelToggle(el, {
+      headerSelector: ".ahx-header",
+      bodySelector: "#ahx_body",
+      toggleSelector: "#ahx_toggle",
+    });
   }
 
   function bindBoundary(el, { targetId, divisionSlug, streetSlug, history }) {
@@ -1203,7 +1241,7 @@
   }
 
   setInterval(handleRoute, ROUTE_POLL_MS);
-  hookFullscreen();
+  hookPanelPlacement();
   handleRoute();
   window.addEventListener("load", handleRoute);
   document.addEventListener("readystatechange", () => {
