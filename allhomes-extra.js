@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.9
+// @version      0.15.0
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -71,6 +71,17 @@
 
   function titleCase(s) {
     return s.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  function slugPathSegment(value) {
+    return String(value || "")
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/['’]/g, "")
+      .replace(/&/g, " and ")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
   }
 
   function daysFrom(value) {
@@ -547,14 +558,15 @@
     const id = suggestion.id;
 
     // Build slug: {state}/{suburb}-{postcode}/{street}-{streetType}/{streetNumber}-pid-{id}/
-    const state = (src.state || "").toLowerCase();
-    const suburb = (src.suburb || "").toLowerCase().replace(/\s+/g, "-");
+    const state = slugPathSegment(src.state);
+    const suburb = slugPathSegment(src.suburb);
     const postcode = src.postcode || "";
-    const street = (src.street || "").toLowerCase();
-    const streetType = (src.streetType || "").toLowerCase();
-    const streetNumber = (src.streetNumber || "").replace(/\//g, "-");
+    const street = slugPathSegment(src.street);
+    const streetType = slugPathSegment(src.streetType);
+    const streetPath = [street, streetType].filter(Boolean).join("-");
+    const streetNumber = slugPathSegment(src.streetNumber);
 
-    return `${state}/${suburb}-${postcode}/${street}-${streetType}/${streetNumber}-pid-${id}/`;
+    return `${state}/${suburb}-${postcode}/${streetPath}/${streetNumber}-pid-${id}/`;
   }
 
   function parsePropertyHtml(html) {
