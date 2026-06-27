@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.5
+// @version      0.14.7
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -15,6 +15,7 @@
   const PANEL_ID = "ahx_panel_stable";
   const SUBURB_PANEL_ID = "ahx_suburb_blocker";
   const SUBURB_STYLE_ID = "ahx_sb_style";
+  const SUBURB_ACTION_SELECTOR = "[data-ahx-action]";
   const BLOCKED_SUBURBS_KEY = "ahx_blocked_suburbs";
   const APP_PROPS_KEY = "__domain_group/APP_PROPS";
   const ROUTE_POLL_MS = 500;
@@ -130,35 +131,43 @@
     let nextHiddenId = 1;
     let scheduled = false;
 
+    function normalizeSuburb(suburb) {
+      return String(suburb || "").trim().toLowerCase();
+    }
+
     function loadBlocked() {
       try {
         const raw = localStorage.getItem(BLOCKED_SUBURBS_KEY);
         const arr = raw ? JSON.parse(raw) : [];
-        return Array.isArray(arr) ? arr.map((s) => String(s).toLowerCase()) : [];
+        return Array.isArray(arr) ? arr.map(normalizeSuburb).filter(Boolean) : [];
       } catch {
         return [];
       }
     }
 
     function saveBlocked(list) {
-      const uniq = [...new Set(list.map((s) => String(s).toLowerCase()))].sort();
+      const uniq = [...new Set(list.map(normalizeSuburb).filter(Boolean))].sort();
       localStorage.setItem(BLOCKED_SUBURBS_KEY, JSON.stringify(uniq));
     }
 
     let blocked = new Set(loadBlocked());
 
     function isBlocked(suburb) {
-      return blocked.has(String(suburb).toLowerCase());
+      return blocked.has(normalizeSuburb(suburb));
     }
 
     function blockSuburb(suburb) {
-      blocked.add(String(suburb).toLowerCase());
+      const key = normalizeSuburb(suburb);
+      if (!key) return;
+      blocked.add(key);
       saveBlocked([...blocked]);
       sync();
     }
 
     function unblockSuburb(suburb) {
-      blocked.delete(String(suburb).toLowerCase());
+      const key = normalizeSuburb(suburb);
+      if (!key) return;
+      blocked.delete(key);
       saveBlocked([...blocked]);
       sync();
     }
@@ -333,14 +342,58 @@
         #${SUBURB_PANEL_ID} .ahx-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:2px 0;}
         #${SUBURB_PANEL_ID} .ahx-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
         #${SUBURB_PANEL_ID} .ahx-count{color:rgba(0,0,0,.45);font-variant-numeric:tabular-nums;}
-        #${SUBURB_PANEL_ID} a.ahx-act{color:#0066cc;cursor:pointer;text-decoration:none;white-space:nowrap;}
-        #${SUBURB_PANEL_ID} a.ahx-act:hover{text-decoration:underline;}
-        #${SUBURB_PANEL_ID} a.ahx-block{color:#c0392b;}
+        #${SUBURB_PANEL_ID} .ahx-act{color:#0066cc;cursor:pointer;text-decoration:none;white-space:nowrap;}
+        #${SUBURB_PANEL_ID} .ahx-act:hover{text-decoration:underline;}
+        #${SUBURB_PANEL_ID} .ahx-block{color:#c0392b;}
         #${SUBURB_PANEL_ID} .ahx-empty{color:rgba(0,0,0,.45);}
         #${SUBURB_PANEL_ID} .ahx-foot{display:flex;justify-content:space-between;margin-top:8px;border-top:1px solid rgba(0,0,0,.08);padding-top:6px;}
         #${SUBURB_PANEL_ID} .ahx-foot a{color:#0066cc;cursor:pointer;}
       `;
       (document.head || document.documentElement).appendChild(style);
+    }
+
+    function getPanelAction(event) {
+      const target = event.target;
+      if (!target) return null;
+      if (typeof target.closest === "function") return target.closest(SUBURB_ACTION_SELECTOR);
+      if (target.parentElement) return target.parentElement.closest(SUBURB_ACTION_SELECTOR);
+      return null;
+    }
+
+    function handlePanelAction(action) {
+      const actionType = action.getAttribute("data-ahx-action");
+      const suburb = action.getAttribute("data-suburb");
+
+      if (actionType === "block") {
+        blockSuburb(suburb);
+        return;
+      }
+      if (actionType === "unblock") {
+        unblockSuburb(suburb);
+        return;
+      }
+      if (actionType === "clear") {
+        clearBlocked();
+        return;
+      }
+      if (actionType === "refresh") sync();
+    }
+
+    function bindSuburbBlockerPanel(el) {
+      bindPanelToggle(el, {
+        headerSelector: ".ahx-header",
+        bodySelector: "#ahx_sb_body",
+        toggleSelector: "#ahx_sb_toggle",
+      });
+
+      el.addEventListener("click", (event) => {
+        const action = getPanelAction(event);
+        if (!action || !el.contains(action)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        handlePanelAction(action);
+      });
     }
 
     function ensureSuburbBlockerPanel() {
@@ -357,11 +410,7 @@
           <div class="ahx-body" id="ahx_sb_body"></div>
         `;
         document.documentElement.appendChild(el);
-        bindPanelToggle(el, {
-          headerSelector: ".ahx-header",
-          bodySelector: "#ahx_sb_body",
-          toggleSelector: "#ahx_sb_toggle",
-        });
+        bindSuburbBlockerPanel(el);
       }
       return el;
     }
@@ -386,7 +435,7 @@
           <div class="ahx-row">
             <span class="ahx-name" title="${escapeHtml(c.suburb)}">${escapeHtml(c.suburb)}</span>
             <span class="ahx-count">${c.visible}</span>
-            <a class="ahx-act ahx-block" data-block="${escapeHtml(c.suburb)}">block</a>
+            <a href="#" class="ahx-act ahx-block" data-ahx-action="block" data-suburb="${escapeHtml(c.suburb)}">block</a>
           </div>`
             )
             .join("")
@@ -402,7 +451,7 @@
           <div class="ahx-row">
             <span class="ahx-name" title="${escapeHtml(titleCase(s))}">${escapeHtml(titleCase(s))}</span>
             <span class="ahx-count">${hiddenCount ? `-${hiddenCount}` : ""}</span>
-            <a class="ahx-act" data-unblock="${escapeHtml(s)}">unblock</a>
+            <a href="#" class="ahx-act" data-ahx-action="unblock" data-suburb="${escapeHtml(s)}">unblock</a>
           </div>`;
             })
             .join("")
@@ -414,19 +463,10 @@
         <div class="ahx-sec">Blocked (${blockedList.length})</div>
         ${blockedHtml}
         <div class="ahx-foot">
-          <a id="ahx_sb_clear">Clear all</a>
-          <a id="ahx_sb_refresh">Refresh</a>
+          <a href="#" class="ahx-act" data-ahx-action="clear">Clear all</a>
+          <a href="#" class="ahx-act" data-ahx-action="refresh">Refresh</a>
         </div>
       `;
-
-      body.querySelectorAll("a[data-block]").forEach((a) =>
-        a.addEventListener("click", () => blockSuburb(a.getAttribute("data-block")))
-      );
-      body.querySelectorAll("a[data-unblock]").forEach((a) =>
-        a.addEventListener("click", () => unblockSuburb(a.getAttribute("data-unblock")))
-      );
-      body.querySelector("#ahx_sb_clear").addEventListener("click", clearBlocked);
-      body.querySelector("#ahx_sb_refresh").addEventListener("click", sync);
     }
 
     function sync() {
@@ -448,7 +488,11 @@
       });
     }
 
-    const observer = new MutationObserver(scheduleSync);
+    const observer = new MutationObserver((mutations) => {
+      const panel = document.getElementById(SUBURB_PANEL_ID);
+      if (panel && mutations.every((mutation) => panel.contains(mutation.target))) return;
+      scheduleSync();
+    });
     observer.observe(document.documentElement, { childList: true, subtree: true });
     setInterval(sync, SUBURB_SYNC_MS);
     sync();
