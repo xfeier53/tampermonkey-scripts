@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.14.3
+// @version      0.14.5
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -320,7 +320,7 @@
           background:rgba(255,255,255,.97);
           border:1px solid rgba(0,0,0,.2);border-radius:10px;
           font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI";
-          width:280px;max-width:44vw;box-shadow:0 6px 18px rgba(0,0,0,.18);color:#111;
+          width:280px;max-width:44vw;box-shadow:0 6px 18px rgba(0,0,0,.18);color:#111;text-align:left;
         }
         #${SUBURB_PANEL_ID} .ahx-header{
           display:flex;align-items:center;justify-content:space-between;
@@ -618,7 +618,7 @@
         border:1px solid rgba(0,0,0,.2);
         border-radius:10px;
         font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI";
-        width:340px;max-width:44vw;box-shadow:0 6px 18px rgba(0,0,0,.18);
+        width:340px;max-width:44vw;box-shadow:0 6px 18px rgba(0,0,0,.18);color:#111;text-align:left;
       }
       #${PANEL_ID} .ahx-header{
         display:flex;align-items:center;justify-content:space-between;
@@ -648,22 +648,21 @@
     );
     if (!dialog) return null;
 
-    const layers = [...document.querySelectorAll("body *")]
-      .filter((node) => {
-        const style = getComputedStyle(node);
-        if (style.position !== "fixed") return false;
-        const zIndex = Number.parseInt(style.zIndex, 10);
-        if (!Number.isFinite(zIndex)) return false;
-        const rect = node.getBoundingClientRect();
-        return rect.width >= innerWidth * 0.8 && rect.height >= innerHeight * 0.8;
-      })
-      .sort(
-        (a, b) =>
-          Number.parseInt(getComputedStyle(b).zIndex, 10) -
-          Number.parseInt(getComputedStyle(a).zIndex, 10)
-      );
+    for (let node = dialog; node && node !== document.body; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      const zIndex = Number.parseInt(style.zIndex, 10);
+      const rect = node.getBoundingClientRect();
+      if (
+        style.position === "fixed" &&
+        Number.isFinite(zIndex) &&
+        rect.width >= innerWidth * 0.8 &&
+        rect.height >= innerHeight * 0.8
+      ) {
+        return node;
+      }
+    }
 
-    return layers[0] || dialog;
+    return dialog;
   }
 
   function currentPanelHost() {
