@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allhomes Extra (stable overlay)
 // @namespace    ahx
-// @version      0.15.0
+// @version      0.15.1
 // @match        https://www.allhomes.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -416,9 +416,9 @@
         el.innerHTML = `
           <div class="ahx-header">
             <span id="ahx_sb_title">Suburb Blocker</span>
-            <span class="ahx-toggle" id="ahx_sb_toggle">–</span>
+            <span class="ahx-toggle" id="ahx_sb_toggle">+</span>
           </div>
-          <div class="ahx-body" id="ahx_sb_body"></div>
+          <div class="ahx-body" id="ahx_sb_body" style="display:none"></div>
         `;
         document.documentElement.appendChild(el);
         bindSuburbBlockerPanel(el);
