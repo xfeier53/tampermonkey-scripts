@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Realestate Extra (stable overlay)
 // @namespace    rex
-// @version      0.6.0
+// @version      0.7.0
 // @match        https://www.realestate.com.au/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @connect      suggest.realestate.com.au
+// @connect      www.allhomes.com.au
 // @connect      www.property.com.au
 // ==/UserScript==
 
@@ -432,6 +433,207 @@
     return `${e(a.street)},+${e(a.suburb)},+${e(a.state)}+${(a.postcode || "").trim()}`;
   }
 
+  // ---- Allhomes listing lookup ----
+
+  const ALLHOMES_ORIGIN = "https://www.allhomes.com.au";
+  const ALLHOMES_LISTING_PATH_RE =
+    /^\/(?!sale\/|sold\/|rent\/|rural\/|commercial\/|new-homes\/|nbh\/|agency\/|agents\/|research\/|news\/|sell(?:\/|$))[^?#]*-(?:act|nsw|vic|qld|sa|wa|tas|nt)-\d{4}\/?$/i;
+  const STREET_TYPE_EXPANSIONS = {
+    av: "avenue",
+    ave: "avenue",
+    blvd: "boulevard",
+    cct: "circuit",
+    cir: "circuit",
+    cr: "crescent",
+    cres: "crescent",
+    ct: "court",
+    dr: "drive",
+    hwy: "highway",
+    ln: "lane",
+    pde: "parade",
+    pl: "place",
+    rd: "road",
+    st: "street",
+    tce: "terrace",
+  };
+
+  function slugifyAllhomesSegment(value) {
+    return String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/[’']/g, " ")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+
+  function allhomesDivisionSlug(parts) {
+    if (!parts || !parts.suburb || !parts.state || !parts.postcode) return null;
+    return `${slugifyAllhomesSegment(parts.suburb)}-${String(parts.state).toLowerCase()}-${String(parts.postcode).trim()}`;
+  }
+
+  function normalizeAllhomesAddress(value) {
+    let s = String(value || "")
+      .toLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/[’']/g, " ")
+      .replace(/,/g, " ")
+      .replace(/[^a-z0-9/ -]+/g, " ")
+      .replace(/-/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    s = s.replace(/\b(av|ave|blvd|cct|cir|cr|cres|ct|dr|hwy|ln|pde|pl|rd|st|tce)\b/g, (m) => STREET_TYPE_EXPANSIONS[m] || m);
+    return s.replace(/\s+/g, " ").trim();
+  }
+
+  function allhomesAddressKeys(value) {
+    const base = normalizeAllhomesAddress(value);
+    if (!base) return [];
+    const keys = new Set([base, base.replace(/\//g, " ")]);
+    const unitParts = base.match(/^(\d+[a-z]?)\s*\/\s*(\d+[a-z]?\b.*)$/i);
+    if (unitParts) {
+      const slashless = `${unitParts[1]} ${unitParts[2]}`.replace(/\s+/g, " ").trim();
+      keys.add(slashless);
+      for (const prefix of ["unit", "apartment", "townhouse", "villa"]) {
+        keys.add(`${prefix} ${slashless}`);
+      }
+    }
+    return [...keys].filter(Boolean);
+  }
+
+  function normalizeAllhomesPath(pathname) {
+    return normalizeAllhomesAddress(String(pathname || "").replace(/^\/+|\/+$/g, "").replace(/\//g, " "));
+  }
+
+  function extractAllhomesCandidates(html) {
+    const out = [];
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(html, "text/html");
+    } catch (e) {
+      return out;
+    }
+
+    for (const a of doc.querySelectorAll("a[href]")) {
+      let url;
+      try {
+        url = new URL(a.getAttribute("href"), ALLHOMES_ORIGIN);
+      } catch (e) {
+        continue;
+      }
+      if (url.origin !== ALLHOMES_ORIGIN || !ALLHOMES_LISTING_PATH_RE.test(url.pathname)) continue;
+      out.push({
+        url: url.href,
+        text: (a.textContent || "").replace(/\s+/g, " ").trim(),
+        pathKey: normalizeAllhomesPath(url.pathname),
+      });
+    }
+    return out;
+  }
+
+  function findMatchingAllhomesCandidate(html, address) {
+    const targetKeys = new Set(allhomesAddressKeys(address));
+    if (!targetKeys.size) return null;
+
+    for (const candidate of extractAllhomesCandidates(html)) {
+      const candidateKeys = allhomesAddressKeys(candidate.text);
+      if (candidate.pathKey) candidateKeys.push(candidate.pathKey);
+      if (allhomesKeysOverlap(candidateKeys, targetKeys)) return candidate;
+    }
+    return null;
+  }
+
+  function allhomesKeysOverlap(candidateKeys, targetKeys) {
+    for (const candidateKey of candidateKeys) {
+      for (const targetKey of targetKeys) {
+        if (
+          candidateKey === targetKey ||
+          candidateKey.startsWith(`${targetKey} `) ||
+          candidateKey.endsWith(` ${targetKey}`) ||
+          candidateKey.includes(` ${targetKey} `)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function allhomesAddressSlug(address) {
+    const base = normalizeAllhomesAddress(address)
+      .replace(/^(unit|apartment|townhouse|villa)\s+/, "")
+      .replace(/\//g, " ");
+    return slugifyAllhomesSegment(base);
+  }
+
+  function guessedAllhomesUrls(address) {
+    const slug = allhomesAddressSlug(address);
+    if (!slug) return [];
+    return [...new Set([slug, `unit-${slug}`, `apartment-${slug}`, `townhouse-${slug}`, `villa-${slug}`])].map((path) => `${ALLHOMES_ORIGIN}/${path}`);
+  }
+
+  function allhomesDetailPageMatches(html, address) {
+    const targetKeys = new Set(allhomesAddressKeys(address));
+    if (!targetKeys.size) return false;
+
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(html, "text/html");
+    } catch (e) {
+      return false;
+    }
+
+    const exactTexts = [...doc.querySelectorAll("h1")]
+      .map((el) => el.textContent || "")
+      .flatMap((text) => allhomesAddressKeys(text));
+    if (allhomesKeysOverlap(exactTexts, targetKeys)) return true;
+
+    const title = normalizeAllhomesAddress(doc.querySelector("title")?.textContent || "");
+    return allhomesKeysOverlap([title], targetKeys);
+  }
+
+  function allhomesSegmentsForMode(mode) {
+    return mode === "sold" ? ["sold", "sale"] : ["sale", "sold"];
+  }
+
+  async function fetchAllhomesLink(address, mode, setStatus) {
+    if (!address) return { ok: false, message: "No address" };
+    const parts = parseAddressParts(address);
+    const divisionSlug = allhomesDivisionSlug(parts);
+
+    if (divisionSlug) {
+      for (const segment of allhomesSegmentsForMode(mode)) {
+        setStatus(`Checking Allhomes ${segment}…`);
+        const url = `${ALLHOMES_ORIGIN}/${segment}/${divisionSlug}/`;
+        let res;
+        try {
+          res = await gmFetch(url, { headers: { Accept: "text/html" } });
+        } catch (e) {
+          continue;
+        }
+        if (!res.ok) continue;
+        const match = findMatchingAllhomesCandidate(await res.text(), address);
+        if (match) return { ok: true, url: match.url, label: match.text, source: segment };
+      }
+    }
+
+    setStatus("Trying Allhomes URL…");
+    for (const url of guessedAllhomesUrls(address)) {
+      let res;
+      try {
+        res = await gmFetch(url, { headers: { Accept: "text/html" } });
+      } catch (e) {
+        continue;
+      }
+      if (!res.ok) continue;
+      if (allhomesDetailPageMatches(await res.text(), address)) {
+        return { ok: true, url, label: address, source: "direct" };
+      }
+    }
+
+    return { ok: false, message: "No matching Allhomes listing found" };
+  }
+
   async function listingPresentAtMin(listingId, locality, min, seg) {
     await randomDelay();
     const url = `https://www.realestate.com.au/${seg}/between-${min}-any-in-${locality}/list-1`;
@@ -545,6 +747,35 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
+  function currentFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  // When the photo gallery enters native fullscreen, the browser paints only the
+  // fullscreen element's subtree (the "top layer"); a panel attached elsewhere in
+  // the DOM becomes invisible and unclickable. Keep the panel inside whatever
+  // element is fullscreen, and move it back to <html> once fullscreen exits.
+  function placeInTopLayer(el) {
+    const fsEl = currentFullscreenElement();
+    if (fsEl && fsEl !== el) {
+      if (!fsEl.contains(el)) fsEl.appendChild(el);
+    } else if (el.parentNode !== document.documentElement) {
+      document.documentElement.appendChild(el);
+    }
+  }
+
+  let fullscreenHooked = false;
+  function hookFullscreen() {
+    if (fullscreenHooked) return;
+    fullscreenHooked = true;
+    const reseat = () => {
+      const el = document.getElementById(PANEL_ID);
+      if (el) placeInTopLayer(el);
+    };
+    document.addEventListener("fullscreenchange", reseat, true);
+    document.addEventListener("webkitfullscreenchange", reseat, true);
+  }
+
   function ensurePanel() {
     ensureStyle();
     let el = document.getElementById(PANEL_ID);
@@ -553,6 +784,7 @@
       el.id = PANEL_ID;
       document.documentElement.appendChild(el);
     }
+    placeInTopLayer(el);
     return el;
   }
 
@@ -647,6 +879,12 @@
       <div><span class="k">Page Views:</span> ${viewsLine}</div>
       ${tierLine}
       <div><span class="k">${priceLabel}:</span> ${priceLine}</div>
+      <div class="sec">
+        <div class="k">Allhomes Link: <span id="rex_ah_link"></span></div>
+        <div id="rex_ah_result" class="mono">Not run</div>
+        <button id="rex_ah_btn">Find Allhomes link</button>
+        <div id="rex_ah_status" class="small"></div>
+      </div>
       <div class="sec">
         <div class="k">Price History:</div>
         <div id="rex_hist_result" class="mono">Loading…</div>
@@ -792,6 +1030,48 @@
     };
   }
 
+  function bindAllhomes(el, address, mode) {
+    const btn = el.querySelector("#rex_ah_btn");
+    const status = el.querySelector("#rex_ah_status");
+    const result = el.querySelector("#rex_ah_result");
+    const link = el.querySelector("#rex_ah_link");
+    if (!btn || !status || !result) return;
+    if (!address) {
+      btn.disabled = true;
+      result.textContent = "N/A";
+      status.textContent = "No address";
+      return;
+    }
+
+    btn.onclick = async () => {
+      btn.disabled = true;
+      result.textContent = "Looking up…";
+      status.textContent = "";
+      if (link) link.textContent = "";
+      const setStatus = (s) => {
+        status.textContent = s;
+      };
+      try {
+        const out = await fetchAllhomesLink(address, mode, setStatus);
+        if (!out.ok) {
+          result.textContent = "N/A";
+          status.textContent = out.message || "Not found";
+          btn.disabled = false;
+          return;
+        }
+
+        result.textContent = out.label || "Matched property";
+        status.textContent = `${out.source} search`;
+        if (link) link.innerHTML = `<a href="${escapeHtml(out.url)}" target="_blank" style="color:#0066cc">(open)</a>`;
+        btn.textContent = "Allhomes link found";
+      } catch (e) {
+        result.textContent = "N/A";
+        status.textContent = "Error: " + String(e);
+        btn.disabled = false;
+      }
+    };
+  }
+
   // ---- Render orchestration ----
 
   function renderListing(el, isSold) {
@@ -804,6 +1084,7 @@
     const L = extractListing(tree);
     el.innerHTML = panelTemplate(renderListingBody(L, isSold));
     bindToggle(el);
+    bindAllhomes(el, L.address, isSold ? "sold" : "sale");
     loadHistory(el, L.address, parseRange(L.searchRange));
     bindInfer(el, L.listingId, L.address, isSold ? "sold" : "buy");
     bindValuation(el, L.address);
@@ -853,6 +1134,12 @@
     const body = `
       ${headLines}
       <div class="sec">
+        <div class="k">Allhomes Link: <span id="rex_ah_link"></span></div>
+        <div id="rex_ah_result" class="mono">Not run</div>
+        <button id="rex_ah_btn">Find Allhomes link</button>
+        <div id="rex_ah_status" class="small"></div>
+      </div>
+      <div class="sec">
         <div class="k">Price History:</div>
         <div id="rex_profile_hist" class="mono">${renderTimeline(P.timeline, null)}</div>
       </div>
@@ -866,6 +1153,7 @@
     `;
     el.innerHTML = panelTemplate(body);
     bindToggle(el);
+    bindAllhomes(el, P.address, /sold/i.test(String(P.marketStatus || "")) ? "sold" : "sale");
     bindValuation(el, P.address);
     if (P.listingUrl) {
       bindInfer(el, getIdFromUrl(P.listingUrl), P.address);
@@ -901,6 +1189,7 @@
     render();
   }, 600);
 
+  hookFullscreen();
   render();
   window.addEventListener("load", render);
   document.addEventListener("readystatechange", () => {
